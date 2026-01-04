@@ -169,6 +169,9 @@ class Translation:
                 temp = ''
                 clear = True
                 for char in translation:
+                    # Check for cancellation during streaming
+                    if self.cancel_request():
+                        raise TranslationCanceled(_('Translation canceled.'))
                     if clear:
                         self.streaming('')
                         clear = False
@@ -176,7 +179,13 @@ class Translation:
                     time.sleep(0.05)
                     temp += char
             else:
-                temp = ''.join([char for char in translation])
+                # For batch mode, still check cancellation periodically
+                temp_chars = []
+                for char in translation:
+                    if self.cancel_request():
+                        raise TranslationCanceled(_('Translation canceled.'))
+                    temp_chars.append(char)
+                temp = ''.join(temp_chars)
             translation = temp
         translation = self.glossary.restore(translation)
         paragraph.translation = translation.strip()

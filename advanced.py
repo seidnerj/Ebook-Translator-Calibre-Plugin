@@ -6,7 +6,7 @@ from qt.core import (  # type: ignore
     QPlainTextEdit, QPushButton, QSplitter, QLabel, QThread, QLineEdit,
     QGridLayout, QProgressBar, pyqtSignal, pyqtSlot, QPixmap, QEvent,
     QStackedWidget, QSpacerItem, QTabWidget, QCheckBox,
-    QComboBox, QSizePolicy)
+    QComboBox, QSizePolicy, QTextCursor)
 from calibre.constants import __version__  # type: ignore
 from calibre.gui2 import I  # type: ignore
 from calibre.utils.localization import _  # type: ignore
@@ -973,6 +973,7 @@ class AdvancedTranslation(QDialog):
         self.review_splitter.setSizes(_size)
 
         def synchronizeScrollbars(editors):
+            """Sync scrollbars between editors using simple pixel-based approach."""
             for editor in editors:
                 for other_editor in editors:
                     if editor != other_editor:
@@ -1139,7 +1140,31 @@ class AdvancedTranslation(QDialog):
             elif isinstance(data, Paragraph):
                 self.table.setCurrentItem(self.table.item(data.row, 0))
             else:
-                translation_text.insertPlainText(data)
+                # Check if user is at bottom (watching stream)
+                scrollbar = translation_text.verticalScrollBar()
+                was_at_bottom = scrollbar.value() >= scrollbar.maximum() - 10
+
+                # Disable updates to prevent auto-scroll/flicker
+                translation_text.setUpdatesEnabled(False)
+                saved_position = scrollbar.value()
+
+                # Append to document using cursor at end
+                doc = translation_text.document()
+                cursor = QTextCursor(doc)
+                end_position = getattr(QTextCursor.MoveOperation, 'End', None) or QTextCursor.End
+                cursor.movePosition(end_position)
+                cursor.insertText(data)
+
+                # Restore scroll position before re-enabling updates
+                if not was_at_bottom:
+                    scrollbar.setValue(saved_position)
+
+                # Re-enable updates - this triggers repaint
+                translation_text.setUpdatesEnabled(True)
+
+                # Scroll to bottom only if user was watching
+                if was_at_bottom:
+                    scrollbar.setValue(scrollbar.maximum())
         self.trans_worker.streaming.connect(streaming_translation)
 
         def modify_translation():

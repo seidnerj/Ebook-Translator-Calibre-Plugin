@@ -37,6 +37,7 @@ class Element:
 
         self.position = None
         self.target_direction = None
+        self.source_lang = None
         self.translation_lang = None
         self.original_color = None
         self.translation_color = None
@@ -737,6 +738,7 @@ class ElementHandler:
             element.set_placeholder(self.placeholder)
             element.set_position(self.position)
             element.set_target_direction(self.target_direction)
+            element.set_source_lang(self.source_lang)
             element.set_translation_lang(self.translation_lang)
             element.set_original_color(self.original_color)
             element.set_translation_color(self.translation_color)
@@ -793,6 +795,7 @@ class ElementHandlerMerge(ElementHandler):
             element.set_placeholder(self.placeholder)
             element.set_position(self.position)
             element.set_target_direction(self.target_direction)
+            element.set_source_lang(self.source_lang)
             element.set_translation_lang(self.translation_lang)
             element.set_original_color(self.original_color)
             element.set_translation_color(self.translation_color)

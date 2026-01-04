@@ -592,6 +592,13 @@ class TranslationSetting(QDialog):
         self.extended_context_enabled.setVisible(False)
         genai_layout.addRow(extended_context_label, self.extended_context_enabled)
 
+        dynamic_timeout_label = QLabel(_('Dynamic Timeout'))
+        dynamic_timeout_enabled = QCheckBox(_(
+            'Scale timeout based on content length (for large merges)'))
+        dynamic_timeout_label.setVisible(False)
+        dynamic_timeout_enabled.setVisible(False)
+        genai_layout.addRow(dynamic_timeout_label, dynamic_timeout_enabled)
+
         sampling_btn_group = QButtonGroup(sampling_widget)
         sampling_btn_group.addButton(temperature, 0)
         sampling_btn_group.addButton(top_p, 1)
@@ -787,12 +794,14 @@ class TranslationSetting(QDialog):
             stream_enabled.toggled.connect(
                 lambda checked: config.update(stream=checked))
 
-            # Claude-specific beta features
+            # Claude-specific features
             # Hide by default, will be shown based on model selection
             extended_output_label.setVisible(False)
             self.extended_output_enabled.setVisible(False)
             extended_context_label.setVisible(False)
             self.extended_context_enabled.setVisible(False)
+            dynamic_timeout_label.setVisible(False)
+            dynamic_timeout_enabled.setVisible(False)
 
             if issubclass(self.current_engine, ClaudeTranslate):
                 # Load configuration values
@@ -802,16 +811,27 @@ class TranslationSetting(QDialog):
                 self.extended_context_enabled.setChecked(
                     config.get('enable_extended_context',
                                self.current_engine.enable_extended_context))
+                dynamic_timeout_enabled.setChecked(
+                    config.get('enable_dynamic_timeout',
+                               self.current_engine.enable_dynamic_timeout))
+
+                # Show dynamic timeout option for all Claude models
+                dynamic_timeout_label.setVisible(True)
+                dynamic_timeout_enabled.setVisible(True)
+
                 # Connect to config updates
                 try:
                     self.extended_output_enabled.toggled.disconnect()
                     self.extended_context_enabled.toggled.disconnect()
+                    dynamic_timeout_enabled.toggled.disconnect()
                 except TypeError:
                     pass
                 self.extended_output_enabled.toggled.connect(
                     lambda checked: config.update(enable_extended_output=checked))
                 self.extended_context_enabled.toggled.connect(
                     lambda checked: config.update(enable_extended_context=checked))
+                dynamic_timeout_enabled.toggled.connect(
+                    lambda checked: config.update(enable_dynamic_timeout=checked))
                 # Update token estimate when context setting changes
                 self.extended_context_enabled.toggled.connect(
                     lambda: self.update_merge_token_estimate())

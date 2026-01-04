@@ -1298,8 +1298,15 @@ class TranslationSetting(QDialog):
         metadata_group = QGroupBox(_('Ebook Metadata'))
         metadata_layout = QFormLayout(metadata_group)
         self.apply_form_layout_policy(metadata_layout)
-        self.metadata_translation = QCheckBox(
-            _('Translate all of the metadata information'))
+
+        # Individual metadata field translation checkboxes
+        self.metadata_translate_title = QCheckBox(
+            _('Title (used if custom title not provided)'))
+        self.metadata_translate_creator = QCheckBox(_('Creator (author)'))
+        self.metadata_translate_creator_file_as = QCheckBox(_('Creator file-as'))
+        self.metadata_translate_publisher = QCheckBox(_('Publisher'))
+        self.metadata_translate_series = QCheckBox(_('Series name'))
+
         self.metadata_lang_mark = QCheckBox(
             _('Append target language to title metadata'))
         self.metadata_lang_code = QCheckBox(
@@ -1307,20 +1314,35 @@ class TranslationSetting(QDialog):
         self.metadata_subject = QPlainTextEdit()
         self.metadata_subject.setPlaceholderText(
             _('Subjects of ebook (one subject per line)'))
-        metadata_layout.addRow(
-            _('Metadata Translation'), self.metadata_translation)
-        metadata_layout.addRow(_('Language Mark'), self.metadata_lang_mark)
+
+        metadata_layout.addRow(_('Translate Fields:'), QLabel(''))
+        metadata_layout.addRow('', self.metadata_translate_title)
+        metadata_layout.addRow('', self.metadata_translate_creator)
+        metadata_layout.addRow('', self.metadata_translate_creator_file_as)
+        metadata_layout.addRow('', self.metadata_translate_publisher)
+        metadata_layout.addRow('', self.metadata_translate_series)
         metadata_layout.addRow(_('Language Code'), self.metadata_lang_code)
+        metadata_layout.addRow(_('Language Mark'), self.metadata_lang_mark)
         metadata_layout.addRow(_('Append Subjects'), self.metadata_subject)
         layout.addWidget(metadata_group)
 
-        self.metadata_translation.setChecked(
-            self.config.get('ebook_metadata.metadata_translation', False))
+        # Load configuration - backward compatibility with old metadata_translation flag
+        old_translate_all = self.config.get('ebook_metadata.metadata_translation', False)
+        self.metadata_translate_title.setChecked(
+            self.config.get('ebook_metadata.translate_title', old_translate_all or True))
+        self.metadata_translate_creator.setChecked(
+            self.config.get('ebook_metadata.translate_creator', old_translate_all))
+        self.metadata_translate_creator_file_as.setChecked(
+            self.config.get('ebook_metadata.translate_creator_file_as', old_translate_all))
+        self.metadata_translate_publisher.setChecked(
+            self.config.get('ebook_metadata.translate_publisher', old_translate_all))
+        self.metadata_translate_series.setChecked(
+            self.config.get('ebook_metadata.translate_series', old_translate_all))
+
         self.metadata_lang_mark.setChecked(
             self.config.get('ebook_metadata.lang_mark', False))
         self.metadata_lang_code.setChecked(self.config.get(
-            'ebook_metadata.lang_code',
-            self.config.get('ebook_metadata.language', False)))  # old key
+            'ebook_metadata.lang_code', True))  # Changed default to True
         self.metadata_subject.setPlainText(
             '\n'.join(self.config.get('ebook_metadata.subjects') or []))
 
@@ -1549,8 +1571,12 @@ class TranslationSetting(QDialog):
         ebook_metadata = self.config.get('ebook_metadata') or {}
         ebook_metadata = ebook_metadata.copy()
         ebook_metadata.clear()
-        ebook_metadata.update(
-            metadata_translation=self.metadata_translation.isChecked())
+        # Individual field translation flags
+        ebook_metadata.update(translate_title=self.metadata_translate_title.isChecked())
+        ebook_metadata.update(translate_creator=self.metadata_translate_creator.isChecked())
+        ebook_metadata.update(translate_creator_file_as=self.metadata_translate_creator_file_as.isChecked())
+        ebook_metadata.update(translate_publisher=self.metadata_translate_publisher.isChecked())
+        ebook_metadata.update(translate_series=self.metadata_translate_series.isChecked())
         ebook_metadata.update(lang_mark=self.metadata_lang_mark.isChecked())
         ebook_metadata.update(lang_code=self.metadata_lang_code.isChecked())
         subject_content = self.metadata_subject.toPlainText().strip()

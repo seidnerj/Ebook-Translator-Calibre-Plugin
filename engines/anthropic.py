@@ -49,6 +49,7 @@ class ClaudeTranslate(GenAI):
     stream = True
     enable_extended_output = False  # 128K output for Claude 3.7 Sonnet
     enable_extended_context = False  # 1M context for Claude Sonnet 4.0/4.5
+    enable_dynamic_timeout = False  # Dynamic timeout based on content length
 
     # event types for streaming are listed here:
     # https://docs.anthropic.com/en/api/messages-streaming
@@ -79,6 +80,8 @@ class ClaudeTranslate(GenAI):
             'enable_extended_output', self.enable_extended_output)
         self.enable_extended_context = self.config.get(
             'enable_extended_context', self.enable_extended_context)
+        self.enable_dynamic_timeout = self.config.get(
+            'enable_dynamic_timeout', self.enable_dynamic_timeout)
 
     def _get_prompt(self):
         prompt = self.prompt.replace('<tlang>', self.target_lang)
@@ -96,6 +99,33 @@ class ClaudeTranslate(GenAI):
             prompt += (' Ensure that placeholders matching the pattern '
                        '{{id_\\d+}} in the content are retained.')
         return prompt
+
+    def translate(self, content):
+        # Use dynamic timeout only if enabled (default: disabled)
+        if self.enable_dynamic_timeout:
+            # Calculate dynamic timeout based on estimated token generation time
+            # Estimate output tokens (conservative: 3 chars per token)
+            estimated_output_tokens = len(content) // 3
+            # Claude models generate 65-120 tokens/second (varies by model)
+            # Use conservative 50 tokens/sec to account for network latency and processing
+            # Source: https://artificialanalysis.ai/models/claude-3-opus
+            # Add 60s base overhead for request processing and network latency
+            estimated_time = (estimated_output_tokens / 50) + 60
+            # Minimum 30s, maximum 2 hours for very large content
+            dynamic_timeout = max(30.0, min(estimated_time, 7200.0))
+
+            # Temporarily set timeout for this request
+            original_timeout = self.request_timeout
+            self.request_timeout = dynamic_timeout
+
+            try:
+                return super().translate(content)
+            finally:
+                # Restore original timeout
+                self.request_timeout = original_timeout
+        else:
+            # Use user-configured timeout (default 30s)
+            return super().translate(content)
 
     def get_models(self):
         model_endpoint = urljoin(self.endpoint, 'models')
@@ -142,9 +172,49 @@ class ClaudeTranslate(GenAI):
         return headers
 
     def get_body(self, text):
+        # Calculate max_tokens based on model and input length
+        # Estimate output will be similar length to input
+        estimated_output_tokens = len(text) // 3  # Conservative: ~3 chars per token
+
+        # Determine model's max output capability based on official docs
+        # Source: https://platform.claude.com/docs/en/about-claude/models/overview
+        if not self.model:
+            model_max_output = 4_096
+        elif self.model.startswith('claude-3-7-sonnet-') and self.enable_extended_output:
+            # Claude 3.7 Sonnet with extended output beta flag
+            model_max_output = 128_000
+        elif self.model.startswith('claude-3-7-sonnet-'):
+            # Claude 3.7 Sonnet without beta flag
+            model_max_output = 64_000
+        elif self.model.startswith('claude-sonnet-4-') or \
+             self.model.startswith('claude-haiku-4-') or \
+             self.model.startswith('claude-opus-4-5') or \
+             self.model.startswith('claude-opus-4-1'):
+            # Claude 4.5 (all variants) and Claude 4.1 Opus: 64K
+            # Also Claude Sonnet 4.0, Haiku 4.5
+            model_max_output = 64_000
+        elif self.model.startswith('claude-opus-4-0'):
+            # Claude Opus 4.0: 32K
+            model_max_output = 32_000
+        elif self.model.startswith('claude-3-haiku-'):
+            # Claude Haiku 3.x: 4K
+            model_max_output = 4_000
+        elif self.model.startswith('claude-'):
+            # Other Claude models: conservative 32K default
+            model_max_output = 32_000
+        else:
+            # Non-Claude models or unknown: very conservative
+            model_max_output = 4_096
+
+        # Use estimated output or model max, whichever is smaller
+        # Add 10% buffer for safety
+        max_tokens = min(int(estimated_output_tokens * 1.1), model_max_output)
+        # Minimum 4096 tokens
+        max_tokens = max(max_tokens, 4_096)
+
         body = {
             'stream': self.stream,
-            'max_tokens': 4096,
+            'max_tokens': max_tokens,
             'model': self.model,
             'top_k': self.top_k,
             'system': self._get_prompt(),

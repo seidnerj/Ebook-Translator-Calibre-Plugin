@@ -882,48 +882,42 @@ def get_pgn_elements(path, encoding):
 
 
 def get_metadata_elements(metadata):
-    config = get_config()
-    metadata_config = config.get('ebook_metadata') or {}
+    """Extract metadata elements (all marked as ignored).
 
-    # Get individual field translation flags
-    translate_title = metadata_config.get('translate_title', False)
-    translate_creator = metadata_config.get('translate_creator', False)
-    translate_publisher = metadata_config.get('translate_publisher', False)
+    ARCHITECTURE CHANGE: All metadata translation now happens during output phase
+    (translate_done in conversion.py), not during OEB processing. This prevents
+    translated metadata from being overwritten when set_metadata() is called.
 
-    # Backward compatibility: check old 'metadata_translation' key
-    old_translate_all = metadata_config.get('metadata_translation', False)
-    if old_translate_all and not any([translate_title, translate_creator, translate_publisher]):
-        # Migrate old setting: enable common fields
-        translate_title = translate_creator = translate_publisher = True
+    This function still extracts metadata elements for backward compatibility
+    (tests, element counting), but marks them ALL as ignored=True so they're
+    not translated during OEB processing.
 
+    All 9 metadata fields translated in output phase via Calibre Metadata API:
+    - title → metadata.title
+    - creator → metadata.authors (list)
+    - publisher → metadata.publisher
+    - series → metadata.series
+    - creator file-as → metadata.author_sort
+    - rights → metadata.rights
+    - subject → metadata.tags (list, excluding plugin tag)
+    - contributor → metadata.book_producer
+    - description → metadata.comments
+    """
     elements = []
-    names = (
-        'title', 'creator', 'publisher', 'rights', 'subject', 'contributor',
-        'description')
+    names = ('title', 'creator', 'publisher', 'rights', 'subject', 'contributor', 'description')
     pattern = re.compile(r'[a-zA-Z]+')
+
     for key in metadata.iterkeys():
         if key not in names:
             continue
         items = getattr(metadata, key)
-
-        # Determine if this field should be translated
-        should_translate = False
-        if key == 'title' and translate_title:
-            should_translate = True
-        elif key == 'creator' and translate_creator:
-            should_translate = True
-        elif key == 'publisher' and translate_publisher:
-            should_translate = True
-        # Note: Other fields (rights, subject, contributor, description) use old behavior
-        elif key in ('rights', 'subject', 'contributor', 'description') and old_translate_all:
-            should_translate = True
-
         for item in items:
             if pattern.search(item.content) is None:
                 continue
-            element = MetadataElement(
-                item, page_id='content.opf', ignored=not should_translate)
+            # Mark all metadata as ignored - translation happens in output phase
+            element = MetadataElement(item, page_id='content.opf', ignored=True)
             elements.append(element)
+
     return elements
 
 

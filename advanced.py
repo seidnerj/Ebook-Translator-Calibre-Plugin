@@ -20,6 +20,7 @@ from .lib.translation import get_engine_class, get_translator, get_translation
 from .lib.element import get_element_handler
 from .lib.conversion import extract_item, extra_formats
 from .engines.openai import ChatgptTranslate, ChatgptBatchTranslate
+from .engines.anthropic import ClaudeTranslate
 from .engines.custom import CustomTranslate
 from .components import (
     EngineList, Footer, SourceLang, TargetLang, InputFormat, OutputFormat,
@@ -90,13 +91,10 @@ class PreparationWorker(QObject):
         element_handler = get_element_handler(
             self.engine_class.placeholder, self.engine_class.separator,
             self.ebook.target_direction)
-        merge_length = str(element_handler.get_merge_length())
-        encoding = ''
-        if self.ebook.encoding.lower() != 'utf-8':
-            encoding = self.ebook.encoding.lower()
-        cache_id = uid(
-            input_path + self.engine_class.name + self.ebook.target_lang
-            + merge_length + encoding)
+        from .lib.utils import get_cache_id
+        merge_length = element_handler.get_merge_length()
+        cache_id = get_cache_id(input_path, self.engine_class.name, self.ebook.target_lang,
+                                merge_length, self.ebook.encoding)
         cache = get_cache(cache_id)
 
         if cache.is_fresh() or not cache.is_persistence():
@@ -1114,6 +1112,23 @@ class AdvancedTranslation(QDialog):
         self.table.row.connect(update_translation_status)
 
         def change_selected_item():
+            # TODO: Allow viewing chunk details during translation
+            # Current limitation: Blocks all selection changes during translation to prevent
+            # data corruption with concurrent/streaming translation.
+            #
+            # Problem: With concurrency > 1, multiple paragraphs stream in parallel.
+            # If user clicks paragraph N while paragraph M is streaming, M's chunks would
+            # get inserted into N's view (data corruption). With single-threaded streaming,
+            # we could track current_streaming_row and discard mismatched chunks, but
+            # concurrent signals from multiple threads interleave unpredictably.
+            #
+            # Potential solutions:
+            # 1. Track streaming state per paragraph (dict[row, is_streaming])
+            # 2. Tag each streaming chunk with paragraph row in the signal
+            # 3. Buffer streaming chunks and only insert when paragraph matches
+            # 4. Disable concurrent translation when streaming is enabled
+            #
+            # For now, maintain original guard to prevent corruption.
             if self.trans_worker.on_working:
                 return
             paragraph = self.table.current_paragraph()
@@ -1140,6 +1155,7 @@ class AdvancedTranslation(QDialog):
             elif isinstance(data, Paragraph):
                 self.table.setCurrentItem(self.table.item(data.row, 0))
             else:
+                # Streaming text chunk
                 # Check if user is at bottom (watching stream)
                 scrollbar = translation_text.verticalScrollBar()
                 was_at_bottom = scrollbar.value() >= scrollbar.maximum() - 10
@@ -1241,6 +1257,56 @@ class AdvancedTranslation(QDialog):
     def get_progress_step(self, total):
         return int(round(100.0 / (total or 1), 100) * 1000000)
 
+    def check_max_tokens_capacity(self):
+        """Check if merge length might exceed model's max output tokens."""
+        if not issubclass(self.engine_class, ClaudeTranslate):
+            return True  # Only check for Claude models
+
+        config = get_config()
+        merge_length = config.get('merge_length', 1800)
+        merge_enabled = config.get('merge_enabled', False)
+
+        if not merge_enabled:
+            return True  # No merge, chunks will be small
+
+        # Get model and settings from engine
+        engine_config = self.engine_class.config
+        model = engine_config.get('model', self.engine_class.model)
+        enable_extended_output = engine_config.get('enable_extended_output', False)
+
+        # Estimate output tokens (conservative: 3 chars per token, +10% buffer)
+        estimated_output_tokens = int((merge_length / 3) * 1.1)
+
+        # Determine model's max output (same logic as in anthropic.py get_body)
+        if not model:
+            model_max_output = 4_096
+        elif model.startswith('claude-3-7-sonnet-') and enable_extended_output:
+            model_max_output = 128_000
+        elif model.startswith('claude-3-7-sonnet-'):
+            model_max_output = 64_000
+        elif model.startswith('claude-sonnet-4-') or model.startswith('claude-haiku-4-') or \
+             model.startswith('claude-opus-4-5') or model.startswith('claude-opus-4-1'):
+            model_max_output = 64_000
+        elif model.startswith('claude-opus-4-0'):
+            model_max_output = 32_000
+        elif model.startswith('claude-3-haiku-'):
+            model_max_output = 4_000
+        else:
+            model_max_output = 32_000
+
+        # Check if estimated output exceeds model capacity
+        if estimated_output_tokens > model_max_output:
+            message = _(
+                'Warning: Merge length ({:,} chars ≈ {:,} tokens) may exceed model max output ({:,} tokens).\n\n'
+                'This could result in incomplete translations. Consider:\n'
+                '• Reducing merge length\n'
+                '• Enabling "Extended Output" (Claude 3.7 Sonnet: 128K tokens)\n\n'
+                'Continue anyway?'
+            ).format(merge_length, estimated_output_tokens, model_max_output)
+            return self.alert.ask(message) == 'yes'
+
+        return True
+
     def translate_all_paragraphs(self):
         """Translate the untranslated paragraphs when at least one is selected.
         Otherwise, retranslate all paragraphs regardless of prior translation.
@@ -1250,6 +1316,11 @@ class AdvancedTranslation(QDialog):
         if is_fresh:
             paragraphs = self.table.get_selected_paragraphs(False, True)
         self.progress_step = self.get_progress_step(len(paragraphs))
+
+        # Check max_tokens capacity before starting
+        if not self.check_max_tokens_capacity():
+            return
+
         if not self.translate_all:
             message = _(
                 'Are you sure you want to translate all {:n} paragraphs?')
@@ -1264,6 +1335,9 @@ class AdvancedTranslation(QDialog):
         if len(paragraphs) == self.table.rowCount():
             self.translate_all_paragraphs()
         else:
+            # Check max_tokens capacity before starting
+            if not self.check_max_tokens_capacity():
+                return
             self.progress_step = self.get_progress_step(len(paragraphs))
             self.trans_worker.translate.emit(paragraphs, True)
 

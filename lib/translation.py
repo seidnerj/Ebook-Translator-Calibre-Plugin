@@ -224,6 +224,15 @@ class Translation:
             self.total += 1
             char_count += len(paragraph.original)
 
+        # Set up prompt caching if enabled
+        # Collect full book context for caching (Claude only)
+        if hasattr(self.translator, 'enable_prompt_caching') and self.translator.enable_prompt_caching:
+            full_context = '\n\n'.join([p.original for p in paragraphs])
+            self.translator.full_book_context = full_context
+            self.log(sep())
+            self.log(_('Prompt caching enabled - using full book context'))
+            self.log(_('Context size: {} characters').format(len(full_context)))
+
         self.log(sep())
         self.log(_('Start to translate ebook content'))
         self.log(sep('┈'))

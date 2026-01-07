@@ -19,9 +19,12 @@ class TestConversionWorker(unittest.TestCase):
         self.worker.api = Mock()
 
         self.ebook = Mock(Ebook)
+        self.ebook.output_format = 'epub'
+        self.ebook.source_lang = 'English'
+        self.ebook.target_direction = None
         self.job = Mock()
         self.worker.working_jobs = {
-            self.job: (self.ebook, str(Path('/path/to/test.epub')))}
+            self.job: (self.ebook, str(Path('/path/to/test.epub')), False)}
 
     def test_create_worker(self):
         self.assertIsInstance(self.worker, ConversionWorker)
@@ -207,7 +210,7 @@ class TestConversionWorker(unittest.TestCase):
         self.ebook.custom_title = 'test custom title'
         self.ebook.target_lang = 'German'
         self.worker.working_jobs = {
-            self.job: (self.ebook, str(Path('/path/to/test.srt')))}
+            self.job: (self.ebook, str(Path('/path/to/test.srt')), False)}
         metadata = Mock()
         self.worker.api.get_metadata.return_value = metadata
         self.worker.api.format_abspath.return_value = \
@@ -270,7 +273,7 @@ class TestConversionWorker(unittest.TestCase):
         self.ebook.custom_title = 'test: custom title*'
         self.ebook.target_lang = 'German'
         self.worker.working_jobs = {
-            self.job: (self.ebook, str(Path('/path/to/test.srt')))}
+            self.job: (self.ebook, str(Path('/path/to/test.srt')), False)}
         metadata = Mock()
         self.worker.api.get_metadata.return_value = metadata
 

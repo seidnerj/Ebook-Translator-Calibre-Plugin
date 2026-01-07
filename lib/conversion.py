@@ -18,7 +18,7 @@ from calibre.ebooks.metadata.meta import (  # type: ignore
 from .. import EbookTranslator
 
 from .config import get_config
-from .utils import log, sep, uid, open_path, open_file
+from .utils import log, sep, open_path, open_file
 from .cache import get_cache
 from .element import (
     get_element_handler, get_srt_elements, get_toc_elements, get_page_elements,
@@ -74,42 +74,8 @@ def convert_book(
         translation.handle(paragraphs)
         element_handler.add_translations(paragraphs)
 
-        # Add RTL/LTR OPF metadata if source and target directions differ
-        if element_handler.source_lang and element_handler.target_direction in ('rtl', 'ltr'):
-            from lxml import etree
-            from ..engines.languages import lang_directionality
-
-            source_direction = lang_directionality.get(element_handler.source_lang, 'ltr')
-
-            # Only add metadata if directions differ
-            if source_direction != element_handler.target_direction:
-                direction = element_handler.target_direction
-                log.info('Source direction (%s) differs from target direction (%s), adding %s metadata...' %
-                         (source_direction, direction, direction.upper()))
-
-                # Add rendition:primary-writing-mode meta tag
-                try:
-                    if hasattr(oeb, 'metadata'):
-                        # EPUB3 rendition namespace
-                        meta_elem = etree.Element(
-                            '{http://www.idpf.org/2007/opf}meta',
-                            attrib={'property': 'rendition:primary-writing-mode'}
-                        )
-                        meta_elem.text = direction
-                        oeb.metadata.append(meta_elem)
-                        log.info('Added primary-writing-mode=%s to OPF metadata' % direction)
-                except Exception as e:
-                    log.warn('Failed to add primary-writing-mode: %s' % e)
-
-                # Set page-progression-direction on spine
-                try:
-                    if hasattr(oeb, 'spine'):
-                        spine_elem = oeb.spine
-                        if hasattr(spine_elem, 'set'):
-                            spine_elem.set('page-progression-direction', direction)
-                            log.info('Set spine page-progression-direction=%s' % direction)
-                except Exception as e:
-                    log.warn('Failed to set page-progression-direction: %s' % e)
+        # RTL/LTR metadata will be added in translate_done() phase
+        # (after EPUB file is written, so we can directly modify the OPF)
 
         log.info(sep())
         log.info(_('Start to convert ebook format...'))
@@ -241,12 +207,9 @@ def convert_item(
     element_handler.set_source_lang(
         translator.get_source_code(translator.source_lang))
 
-    merge_length = str(element_handler.get_merge_length())
-    _encoding = ''
-    if encoding.lower() != 'utf-8':
-        _encoding = encoding.lower()
-    cache_id = uid(
-        input_path + translator.name + target_lang + merge_length + _encoding)
+    from .utils import get_cache_id
+    merge_length = element_handler.get_merge_length()
+    cache_id = get_cache_id(input_path, translator.name, target_lang, merge_length, encoding)
     cache = get_cache(cache_id)
     cache.set_cache_only(cache_only)
     cache.set_info('title', ebook_title)
@@ -255,6 +218,8 @@ def convert_item(
     cache.set_info('merge_length', merge_length)
     cache.set_info('plugin_version', EbookTranslator.__version__)
     cache.set_info('calibre_version', __version__)
+    cache.set_info('source_lang', source_lang)
+    cache.set_info('target_direction', direction)
 
     translation = get_translation(
         translator, lambda text, error=False: log.info(text))
@@ -282,6 +247,63 @@ def convert_item(
     convertor(
         input_path, output_path, translation, element_handler, cache,
         debug_info, encoding, notification)
+
+    # Translate metadata in background job before cache.done()
+    # This avoids UI freeze in translate_done() which runs in GUI thread
+    if not cache_only and convertor == convert_book:
+        config = get_config()
+        ebook_metadata_config = config.get('ebook_metadata') or {}
+        if ebook_metadata_config:
+            try:
+                from calibre.ebooks.metadata.meta import get_metadata as read_metadata
+
+                with open(output_path, 'r+b') as file:
+                    metadata = read_metadata(file, 'epub')
+
+                    # Disable streaming for metadata
+                    original_stream = translator.stream
+                    translator.stream = False
+
+                    def translate_and_cache(field_name, value):
+                        result = translator.translate(value)
+                        if hasattr(result, '__iter__') and not isinstance(result, str):
+                            result = ''.join(result)
+                        if result and result.strip():
+                            cache.set_info('translated_' + field_name, result.strip())
+
+                    # Translate each field if enabled
+                    if metadata.title and ebook_metadata_config.get('translate_title', False):
+                        translate_and_cache('title', metadata.title)
+                    if metadata.series and ebook_metadata_config.get('translate_series', False):
+                        translate_and_cache('series', metadata.series)
+                    if metadata.author_sort and ebook_metadata_config.get('translate_creator_file_as', False):
+                        translate_and_cache('author_sort', metadata.author_sort)
+                    if metadata.publisher and ebook_metadata_config.get('translate_publisher', False):
+                        translate_and_cache('publisher', metadata.publisher)
+                    if metadata.rights and ebook_metadata_config.get('translate_rights', False):
+                        translate_and_cache('rights', metadata.rights)
+                    if metadata.comments and ebook_metadata_config.get('translate_description', False):
+                        translate_and_cache('description', metadata.comments)
+                    if metadata.book_producer and ebook_metadata_config.get('translate_contributor', False):
+                        translate_and_cache('book_producer', metadata.book_producer)
+
+                    # Translate authors list
+                    if metadata.authors and ebook_metadata_config.get('translate_creator', False):
+                        translated_authors = []
+                        for author in metadata.authors:
+                            result = translator.translate(author)
+                            if hasattr(result, '__iter__') and not isinstance(result, str):
+                                result = ''.join(result)
+                            if result and result.strip():
+                                translated_authors.append(result.strip())
+                        if translated_authors:
+                            cache.set_info('translated_authors', '||'.join(translated_authors))
+
+                    translator.stream = original_stream
+                    log.info('Metadata translation completed in background')
+            except Exception as e:
+                log.warn('Failed to translate metadata in background: %s' % e)
+
     cache.done()
 
 
@@ -318,10 +340,11 @@ class ConversionWorker:
                  ebook.encoding, ebook.target_direction)),
             description=(_('[{} > {}] Translating "{}"').format(
                 ebook.source_lang, ebook.target_lang, ebook.title)))
-        self.working_jobs[job] = (ebook, output_path)
+        self.working_jobs[job] = (ebook, output_path, cache_only)
 
     def translate_done(self, job):
-        ebook, output_path = self.working_jobs.pop(job)
+        ebook, output_path, cache_only = self.working_jobs.pop(job)
+        log.info('translate_done called: cache_only=%s, format=%s' % (cache_only, ebook.output_format))
 
         if job.failed:
             if not DEBUG:
@@ -331,35 +354,166 @@ class ConversionWorker:
 
         # TODO: Try to use the calibre generated metadata file.
         ebook_metadata_config = self.config.get('ebook_metadata') or {}
+        log.info('ebook_metadata_config: %s' % ebook_metadata_config)
+        log.info('is_extra_format: %s' % ebook.is_extra_format())
+
         if not ebook.is_extra_format():
             with open(output_path, 'r+b') as file:
                 metadata = get_metadata(file, ebook.output_format)
+                log.info('Read metadata: title=%s, authors=%s, publisher=%s, series=%s, language=%s' % (
+                    metadata.title, metadata.authors, metadata.publisher, metadata.series, metadata.language))
 
-                # Handle series and author_sort translation if enabled
-                # These fields aren't in oeb.metadata iteration, so translate them here
-                if (ebook_metadata_config.get('translate_series') and metadata.series) or \
-                   (ebook_metadata_config.get('translate_creator_file_as') and metadata.author_sort):
+                # Get translator for metadata translation and RTL/LTR handling
+                translator = get_translator()
+
+                # Handle metadata field translation if enabled
+                # All metadata translation happens here during output phase, not during OEB processing
+                # This ensures translated values aren't overwritten by set_metadata()
+                needs_translation = cache_only and (
+                    (metadata.title and ebook_metadata_config.get('translate_title', False)) or
+                    (metadata.series and ebook_metadata_config.get('translate_series', False)) or
+                    (metadata.author_sort and ebook_metadata_config.get('translate_creator_file_as', False)) or
+                    (metadata.authors and ebook_metadata_config.get('translate_creator', False)) or
+                    (metadata.publisher and ebook_metadata_config.get('translate_publisher', False)) or
+                    (metadata.rights and ebook_metadata_config.get('translate_rights', False)) or
+                    (metadata.tags and ebook_metadata_config.get('translate_subject', False)) or
+                    (metadata.book_producer and ebook_metadata_config.get('translate_contributor', False)) or
+                    (metadata.comments and ebook_metadata_config.get('translate_description', False))
+                )
+                log.info('needs_translation: %s (cache_only=%s)' % (needs_translation, cache_only))
+
+                if needs_translation:
                     try:
-                        # Create translator instance for these fields
-                        translator = get_translator()
-                        translator.set_source_lang(ebook.source_lang)
-                        translator.set_target_lang(ebook.target_lang)
+                        # Read translated metadata from cache (translated in background job)
+                        # This avoids API calls in GUI thread which would freeze UI
+                        from .cache import get_cache
+                        from .utils import get_cache_id
 
-                        if ebook_metadata_config.get('translate_series') and metadata.series:
-                            translated_series = translator.translate(metadata.series)
-                            if translated_series and translated_series.strip():
-                                log.info('Translated series: %s -> %s' % (
-                                    metadata.series, translated_series))
-                                metadata.series = translated_series.strip()
+                        # Get cache using same ID calculation as convert_item
+                        merge_length = self.config.get('merge_length', 1800)
+                        cache_id = get_cache_id(ebook.get_input_path(), translator.name, ebook.target_lang,
+                                                merge_length, ebook.encoding)
+                        cache = get_cache(cache_id)
 
-                        if ebook_metadata_config.get('translate_creator_file_as') and metadata.author_sort:
-                            translated_author_sort = translator.translate(metadata.author_sort)
-                            if translated_author_sort and translated_author_sort.strip():
-                                log.info('Translated author_sort: %s -> %s' % (
-                                    metadata.author_sort, translated_author_sort))
-                                metadata.author_sort = translated_author_sort.strip()
+                        # Check if any cached translations exist
+                        has_cached = cache.get_info('translated_title') or cache.get_info('translated_series') or \
+                                    cache.get_info('translated_authors')
+
+                        if not has_cached:
+                            # Old cache without metadata - translate now (will cause brief UI freeze)
+                            log.warn('No cached metadata translations - translating now (UI may freeze briefly)')
+                            translator.set_source_lang(ebook.source_lang)
+                            translator.set_target_lang(ebook.target_lang)
+                            original_stream = translator.stream
+                            translator.stream = False
+
+                            def translate_field(text):
+                                result = translator.translate(text)
+                                if hasattr(result, '__iter__') and not isinstance(result, str):
+                                    result = ''.join(result)
+                                return result.strip() if result else None
+                        else:
+                            translate_field = lambda text: None  # Not used, reading from cache
+
+                        # Apply cached translated values (or translate if cache empty)
+                        if metadata.title and ebook_metadata_config.get('translate_title', False) and not ebook.custom_title:
+                            translated = cache.get_info('translated_title') or (translate_field(metadata.title) if not has_cached else None)
+                            if translated:
+                                metadata.title = translated
+                                metadata.title_sort = translated
+
+                        if metadata.series and ebook_metadata_config.get('translate_series', False):
+                            translated = cache.get_info('translated_series') or (translate_field(metadata.series) if not has_cached else None)
+                            if translated:
+                                metadata.series = translated
+
+                        if metadata.author_sort and ebook_metadata_config.get('translate_creator_file_as', False):
+                            translated = cache.get_info('translated_author_sort') or (translate_field(metadata.author_sort) if not has_cached else None)
+                            if translated:
+                                metadata.author_sort = translated
+
+                        if metadata.publisher and ebook_metadata_config.get('translate_publisher', False):
+                            translated = cache.get_info('translated_publisher') or (translate_field(metadata.publisher) if not has_cached else None)
+                            if translated:
+                                metadata.publisher = translated
+
+                        if metadata.rights and ebook_metadata_config.get('translate_rights', False):
+                            translated = cache.get_info('translated_rights') or (translate_field(metadata.rights) if not has_cached else None)
+                            if translated:
+                                metadata.rights = translated
+
+                        if metadata.comments and ebook_metadata_config.get('translate_description', False):
+                            translated = cache.get_info('translated_description') or (translate_field(metadata.comments) if not has_cached else None)
+                            if translated:
+                                metadata.comments = translated
+
+                        if metadata.book_producer and ebook_metadata_config.get('translate_contributor', False):
+                            translated = cache.get_info('translated_book_producer') or (translate_field(metadata.book_producer) if not has_cached else None)
+                            if translated:
+                                metadata.book_producer = translated
+
+                        # Apply cached translated authors
+                        if metadata.authors and ebook_metadata_config.get('translate_creator', False):
+                            translated_authors_str = cache.get_info('translated_authors')
+                            if translated_authors_str:
+                                metadata.authors = translated_authors_str.split('||')
+                            elif not has_cached:
+                                # Translate authors live if not cached
+                                translated_authors = []
+                                for author in metadata.authors:
+                                    translated = translate_field(author)
+                                    if translated:
+                                        translated_authors.append(translated)
+                                if translated_authors:
+                                    metadata.authors = translated_authors
+
+                        # Restore streaming if we disabled it
+                        if not has_cached and 'original_stream' in locals():
+                            translator.stream = original_stream
+
+                        log.info('Applied %s metadata (from cache)' % ('cached' if has_cached else 'fresh'))
                     except Exception as e:
-                        log.warn('Failed to translate series/author_sort: %s' % e)
+                        log.warn('Failed to apply cached metadata: %s' % e)
+
+                # Add RTL/LTR metadata to OPF if directions differ
+                # Do this by directly modifying the EPUB's content.opf file
+                from lxml import etree
+                from ..engines.languages import lang_directionality
+                source_lang_code = translator.get_source_code(ebook.source_lang)
+                source_lang_base = source_lang_code.split('-')[0] if source_lang_code else None
+                source_direction = lang_directionality.get(source_lang_code,
+                                                          lang_directionality.get(source_lang_base, 'ltr'))
+                target_direction = ebook.target_direction.lower() if ebook.target_direction else None
+
+                if target_direction in ('rtl', 'ltr') and source_direction != target_direction:
+                    try:
+                        from calibre.ebooks.oeb.polish.container import get_container
+                        from lxml import etree
+
+                        writing_mode = 'horizontal-rl' if target_direction == 'rtl' else 'horizontal-lr'
+
+                        # Use Calibre's polish Container for efficient EPUB modification
+                        container = get_container(output_path, tweak_mode=True)
+                        opf_root = container.opf
+
+                        # Add primary-writing-mode meta
+                        ns = {'opf': 'http://www.idpf.org/2007/opf'}
+                        metadata_elem = opf_root.xpath('//opf:metadata', namespaces=ns)[0]
+                        etree.SubElement(metadata_elem, '{http://www.idpf.org/2007/opf}meta',
+                                        attrib={'name': 'primary-writing-mode', 'content': writing_mode})
+
+                        # Set spine page-progression-direction
+                        spine_elem = opf_root.xpath('//opf:spine', namespaces=ns)[0]
+                        spine_elem.set('page-progression-direction', target_direction)
+
+                        # Commit changes - Container efficiently updates only the OPF file in ZIP
+                        container.dirty(container.opf_name)
+                        container.commit()
+
+                        log.info('Added RTL metadata: primary-writing-mode=%s, page-progression-direction=%s' %
+                                (writing_mode, target_direction))
+                    except Exception as e:
+                        log.warn('Failed to add RTL metadata to EPUB: %s' % e)
 
                 ebook_title = metadata.title
                 if ebook.custom_title is not None:

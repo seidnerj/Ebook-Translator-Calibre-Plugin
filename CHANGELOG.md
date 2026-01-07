@@ -1,3 +1,42 @@
+## v2.4.2
+
+Enhanced Claude integration with beta features, comprehensive metadata translation, and RTL/LTR ebook formatting support:
+
+**Claude Enhancements:**
+1. feat: Add UI controls for Claude extended output (128K) and context (1M) beta features
+2. feat: Add token estimate helper for merge translation with language-specific ratios
+3. feat: Update default model to claude-sonnet-4-5
+4. feat: Implement dynamic max_tokens calculation based on input length and model capabilities
+5. feat: Add optional dynamic timeout scaling based on content length
+6. feat: Add prompt caching support for parallel translation with full book context
+7. feat: Implement ClaudeBatchTranslate for asynchronous bulk translation (50% cost reduction)
+
+**Metadata Translation:**
+1. feat: Replace single metadata checkbox with 9 individual field controls
+2. feat: Translate title, creator, publisher, series, author_sort during output phase
+3. feat: Add support for rights, subject, contributor, description metadata fields
+4. feat: Auto-migrate old metadata_translation config to new individual flags on plugin load
+5. fix: Set language code (dc:language) to target language by default
+
+**RTL/LTR Ebook Formatting:**
+1. feat: Add conditional text-align inline styles when source/target directions differ
+2. feat: Add RTL/LTR page-progression-direction to spine
+3. feat: Expand language directionality dictionary (Hebrew, Arabic, Farsi, Urdu, etc.)
+4. fix: Convert Hebrew language code 'iw' to 'he' for Calibre compatibility
+5. fix: Handle language codes with region suffixes (en-US → en)
+
+**Translation Quality:**
+1. fix: Prevent partial translations with dynamic max_tokens scaling
+2. fix: Add pre-translation warning when merge length exceeds model max output
+3. fix: Proper cancellation during streaming (stop button now works immediately)
+
+**UI/UX Improvements:**
+1. fix: Improve streaming text insertion without scroll position disruption
+2. fix: Add TODO for enabling chunk viewing during concurrent translation
+3. feat: Translate series/author_sort only during output phase (always fresh)
+
+---
+
 ## v2.4.1
 
 Added features and fixed bugs as follows:

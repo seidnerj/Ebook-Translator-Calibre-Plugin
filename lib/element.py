@@ -882,6 +882,24 @@ def get_pgn_elements(path, encoding):
 
 
 def get_metadata_elements(metadata):
+    """Extract metadata elements for separate translation (not as paragraphs).
+
+    Metadata is translated individually and cached in info table, not paragraph table.
+    Each field is displayed separately in UI, not mixed with content paragraphs.
+
+    Extracts all 9 metadata fields:
+    - title (dc:title)
+    - creator (dc:creator)
+    - publisher (dc:publisher)
+    - series (calibre:series)
+    - author_sort (calibre:author_sort / opf:file-as)
+    - rights (dc:rights)
+    - subject (dc:subject)
+    - contributor (dc:contributor)
+    - description (dc:description)
+
+    Each field respects individual translation settings from config.
+    """
     config = get_config()
     metadata_config = config.get('ebook_metadata') or {}
 
@@ -889,6 +907,15 @@ def get_metadata_elements(metadata):
     translate_title = metadata_config.get('translate_title', False)
     translate_creator = metadata_config.get('translate_creator', False)
     translate_publisher = metadata_config.get('translate_publisher', False)
+    translate_series = metadata_config.get('translate_series', False)
+    translate_rights = metadata_config.get('translate_rights', False)
+    translate_subject = metadata_config.get('translate_subject', False)
+    translate_contributor = metadata_config.get('translate_contributor', False)
+    translate_description = metadata_config.get('translate_description', False)
+
+    # title_sort and author_sort follow their parent fields (no separate settings)
+    translate_title_sort = translate_title
+    translate_author_sort = translate_creator
 
     # Backward compatibility: check old 'metadata_translation' key
     old_translate_all = metadata_config.get('metadata_translation', False)
@@ -897,10 +924,10 @@ def get_metadata_elements(metadata):
         translate_title = translate_creator = translate_publisher = True
 
     elements = []
-    names = (
-        'title', 'creator', 'publisher', 'rights', 'subject', 'contributor',
-        'description')
+    # Include series, title_sort, and author_sort (Calibre-specific fields)
+    names = ('title', 'title_sort', 'creator', 'author_sort', 'publisher', 'series', 'rights', 'subject', 'contributor', 'description')
     pattern = re.compile(r'[a-zA-Z]+')
+
     for key in metadata.iterkeys():
         if key not in names:
             continue
@@ -914,16 +941,29 @@ def get_metadata_elements(metadata):
             should_translate = True
         elif key == 'publisher' and translate_publisher:
             should_translate = True
-        # Note: Other fields (rights, subject, contributor, description) use old behavior
-        elif key in ('rights', 'subject', 'contributor', 'description') and old_translate_all:
+        elif key == 'series' and translate_series:
+            should_translate = True
+        elif key == 'title_sort' and translate_title_sort:
+            should_translate = True
+        elif key == 'author_sort' and translate_author_sort:
+            should_translate = True
+        elif key == 'rights' and (translate_rights or old_translate_all):
+            should_translate = True
+        elif key == 'subject' and (translate_subject or old_translate_all):
+            should_translate = True
+        elif key == 'contributor' and (translate_contributor or old_translate_all):
+            should_translate = True
+        elif key == 'description' and (translate_description or old_translate_all):
             should_translate = True
 
         for item in items:
             if pattern.search(item.content) is None:
                 continue
+            # Store element reference for translation, but mark ignored for paragraph system
             element = MetadataElement(
                 item, page_id='content.opf', ignored=not should_translate)
             elements.append(element)
+
     return elements
 
 

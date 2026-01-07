@@ -11,7 +11,7 @@ from glob import glob
 
 from calibre.utils.localization import _  # type: ignore
 
-from .utils import size_by_unit
+from .utils import size_by_unit, log
 from .config import get_config
 
 
@@ -301,6 +301,7 @@ class TranslationCache:
         paragraphs = []
         for item in self.all():
             paragraph = Paragraph(*item)
+            # In cache_only mode, skip paragraphs without translations
             if self.cache_only and not paragraph.translation:
                 continue
             paragraphs.append(paragraph)

@@ -373,8 +373,14 @@ class TranslationSetting(QDialog):
         # Job Log
         log_group = QGroupBox(_('Job Log'))
         log_translation = QCheckBox(_('Show translation'))
+        log_content = QCheckBox(_('Show original/translated content'))
+        log_content.setToolTip(_(
+            'Show the full original and translated text for each paragraph in the log.\n'
+            'Disable to reduce log verbosity.\n'
+            'Default: ON'))
         log_layout = QVBoxLayout(log_group)
         log_layout.addWidget(log_translation)
+        log_layout.addWidget(log_content)
         log_layout.addStretch(1)
         misc_layout.addWidget(log_group, 1)
 
@@ -390,6 +396,10 @@ class TranslationSetting(QDialog):
         log_translation.setChecked(self.config.get('log_translation', True))
         log_translation.toggled.connect(
             lambda checked: self.config.update(log_translation=checked))
+
+        log_content.setChecked(self.config.get('log_content', True))
+        log_content.toggled.connect(
+            lambda checked: self.config.update(log_content=checked))
 
         notice.setChecked(self.config.get('show_notification', True))
         notice.toggled.connect(
@@ -599,6 +609,13 @@ class TranslationSetting(QDialog):
         dynamic_timeout_enabled.setVisible(False)
         genai_layout.addRow(dynamic_timeout_label, dynamic_timeout_enabled)
 
+        prompt_caching_label = QLabel(_('Prompt Caching'))
+        prompt_caching_enabled = QCheckBox(_(
+            'Enable parallel sections with full book context (90% cheaper input)'))
+        prompt_caching_label.setVisible(False)
+        prompt_caching_enabled.setVisible(False)
+        genai_layout.addRow(prompt_caching_label, prompt_caching_enabled)
+
         sampling_btn_group = QButtonGroup(sampling_widget)
         sampling_btn_group.addButton(temperature, 0)
         sampling_btn_group.addButton(top_p, 1)
@@ -802,6 +819,8 @@ class TranslationSetting(QDialog):
             self.extended_context_enabled.setVisible(False)
             dynamic_timeout_label.setVisible(False)
             dynamic_timeout_enabled.setVisible(False)
+            prompt_caching_label.setVisible(False)
+            prompt_caching_enabled.setVisible(False)
 
             if issubclass(self.current_engine, ClaudeTranslate):
                 # Load configuration values
@@ -814,16 +833,22 @@ class TranslationSetting(QDialog):
                 dynamic_timeout_enabled.setChecked(
                     config.get('enable_dynamic_timeout',
                                self.current_engine.enable_dynamic_timeout))
+                prompt_caching_enabled.setChecked(
+                    config.get('enable_prompt_caching',
+                               self.current_engine.enable_prompt_caching))
 
-                # Show dynamic timeout option for all Claude models
+                # Show options for all Claude models
                 dynamic_timeout_label.setVisible(True)
                 dynamic_timeout_enabled.setVisible(True)
+                prompt_caching_label.setVisible(True)
+                prompt_caching_enabled.setVisible(True)
 
                 # Connect to config updates
                 try:
                     self.extended_output_enabled.toggled.disconnect()
                     self.extended_context_enabled.toggled.disconnect()
                     dynamic_timeout_enabled.toggled.disconnect()
+                    prompt_caching_enabled.toggled.disconnect()
                 except TypeError:
                     pass
                 self.extended_output_enabled.toggled.connect(
@@ -832,6 +857,8 @@ class TranslationSetting(QDialog):
                     lambda checked: config.update(enable_extended_context=checked))
                 dynamic_timeout_enabled.toggled.connect(
                     lambda checked: config.update(enable_dynamic_timeout=checked))
+                prompt_caching_enabled.toggled.connect(
+                    lambda checked: config.update(enable_prompt_caching=checked))
                 # Update token estimate when context setting changes
                 self.extended_context_enabled.toggled.connect(
                     lambda: self.update_merge_token_estimate())
@@ -1320,50 +1347,70 @@ class TranslationSetting(QDialog):
         self.apply_form_layout_policy(metadata_layout)
 
         # Individual metadata field translation checkboxes
+        # Primary fields (most commonly used)
         self.metadata_translate_title = QCheckBox(
             _('Title (used if custom title not provided)'))
         self.metadata_translate_creator = QCheckBox(_('Creator (author)'))
-        self.metadata_translate_creator_file_as = QCheckBox(_('Creator file-as'))
         self.metadata_translate_publisher = QCheckBox(_('Publisher'))
         self.metadata_translate_series = QCheckBox(_('Series name'))
+
+        # Advanced fields (less commonly used)
+        self.metadata_translate_creator_file_as = QCheckBox(_('Creator file-as (author sort)'))
+        self.metadata_translate_rights = QCheckBox(_('Rights (copyright)'))
+        self.metadata_translate_subject = QCheckBox(_('Subject (keywords)'))
+        self.metadata_translate_contributor = QCheckBox(_('Contributors (editors, etc.)'))
+        self.metadata_translate_description = QCheckBox(_('Description'))
 
         self.metadata_lang_mark = QCheckBox(
             _('Append target language to title metadata'))
         self.metadata_lang_code = QCheckBox(
             _('Set target language code to language metadata'))
-        self.metadata_subject = QPlainTextEdit()
-        self.metadata_subject.setPlaceholderText(
+        self.metadata_subjects = QPlainTextEdit()
+        self.metadata_subjects.setPlaceholderText(
             _('Subjects of ebook (one subject per line)'))
 
         metadata_layout.addRow(_('Translate Fields:'), QLabel(''))
         metadata_layout.addRow('', self.metadata_translate_title)
         metadata_layout.addRow('', self.metadata_translate_creator)
-        metadata_layout.addRow('', self.metadata_translate_creator_file_as)
         metadata_layout.addRow('', self.metadata_translate_publisher)
         metadata_layout.addRow('', self.metadata_translate_series)
+        metadata_layout.addRow(_('Advanced Fields:'), QLabel(''))
+        metadata_layout.addRow('', self.metadata_translate_creator_file_as)
+        metadata_layout.addRow('', self.metadata_translate_rights)
+        metadata_layout.addRow('', self.metadata_translate_subject)
+        metadata_layout.addRow('', self.metadata_translate_contributor)
+        metadata_layout.addRow('', self.metadata_translate_description)
         metadata_layout.addRow(_('Language Code'), self.metadata_lang_code)
         metadata_layout.addRow(_('Language Mark'), self.metadata_lang_mark)
-        metadata_layout.addRow(_('Append Subjects'), self.metadata_subject)
+        metadata_layout.addRow(_('Append Subjects'), self.metadata_subjects)
         layout.addWidget(metadata_group)
 
-        # Load configuration - backward compatibility with old metadata_translation flag
-        old_translate_all = self.config.get('ebook_metadata.metadata_translation', False)
+        # Migration happens automatically on plugin load (lib/config.py ver241_upgrade)
+        # Load configuration
         self.metadata_translate_title.setChecked(
-            self.config.get('ebook_metadata.translate_title', old_translate_all or True))
+            self.config.get('ebook_metadata.translate_title', True))
         self.metadata_translate_creator.setChecked(
-            self.config.get('ebook_metadata.translate_creator', old_translate_all))
+            self.config.get('ebook_metadata.translate_creator', False))
         self.metadata_translate_creator_file_as.setChecked(
-            self.config.get('ebook_metadata.translate_creator_file_as', old_translate_all))
+            self.config.get('ebook_metadata.translate_creator_file_as', False))
         self.metadata_translate_publisher.setChecked(
-            self.config.get('ebook_metadata.translate_publisher', old_translate_all))
+            self.config.get('ebook_metadata.translate_publisher', False))
         self.metadata_translate_series.setChecked(
-            self.config.get('ebook_metadata.translate_series', old_translate_all))
+            self.config.get('ebook_metadata.translate_series', False))
+        self.metadata_translate_rights.setChecked(
+            self.config.get('ebook_metadata.translate_rights', False))
+        self.metadata_translate_subject.setChecked(
+            self.config.get('ebook_metadata.translate_subject', False))
+        self.metadata_translate_contributor.setChecked(
+            self.config.get('ebook_metadata.translate_contributor', False))
+        self.metadata_translate_description.setChecked(
+            self.config.get('ebook_metadata.translate_description', False))
 
         self.metadata_lang_mark.setChecked(
             self.config.get('ebook_metadata.lang_mark', False))
         self.metadata_lang_code.setChecked(self.config.get(
             'ebook_metadata.lang_code', True))  # Changed default to True
-        self.metadata_subject.setPlainText(
+        self.metadata_subjects.setPlainText(
             '\n'.join(self.config.get('ebook_metadata.subjects') or []))
 
         layout.addStretch(1)
@@ -1592,14 +1639,19 @@ class TranslationSetting(QDialog):
         ebook_metadata = ebook_metadata.copy()
         ebook_metadata.clear()
         # Individual field translation flags
+        # Save all 9 metadata translation flags
         ebook_metadata.update(translate_title=self.metadata_translate_title.isChecked())
         ebook_metadata.update(translate_creator=self.metadata_translate_creator.isChecked())
         ebook_metadata.update(translate_creator_file_as=self.metadata_translate_creator_file_as.isChecked())
         ebook_metadata.update(translate_publisher=self.metadata_translate_publisher.isChecked())
         ebook_metadata.update(translate_series=self.metadata_translate_series.isChecked())
+        ebook_metadata.update(translate_rights=self.metadata_translate_rights.isChecked())
+        ebook_metadata.update(translate_subject=self.metadata_translate_subject.isChecked())
+        ebook_metadata.update(translate_contributor=self.metadata_translate_contributor.isChecked())
+        ebook_metadata.update(translate_description=self.metadata_translate_description.isChecked())
         ebook_metadata.update(lang_mark=self.metadata_lang_mark.isChecked())
         ebook_metadata.update(lang_code=self.metadata_lang_code.isChecked())
-        subject_content = self.metadata_subject.toPlainText().strip()
+        subject_content = self.metadata_subjects.toPlainText().strip()
         if subject_content:
             subjects = [s.strip() for s in subject_content.split('\n')]
             ebook_metadata.update(subjects=subjects)

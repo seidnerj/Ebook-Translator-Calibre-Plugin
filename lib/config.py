@@ -24,6 +24,7 @@ defaults: dict[str, Any] = {
     'cache_enabled': True,
     'cache_path': None,
     'log_translation': True,
+    'log_content': True,
     'show_notification': True,
     'translation_position': None,
     'column_gap': {
@@ -117,6 +118,8 @@ def upgrade_config():
         ver205_upgrade(config)
     if version >= (2, 4, 0):  # type: ignore
         ver240_upgrade()
+    if version >= (2, 4, 2):  # type: ignore
+        ver242_upgrade(config)
 
 
 def ver200_upgrade(config):
@@ -219,3 +222,32 @@ def ver240_upgrade():
         os.rename(
             os.path.join(new_config_path, EbookTranslator.identifier + '.ini'),
             os.path.join(new_config_path, 'settings.ini'))
+
+
+def ver242_upgrade(config):
+    """Migrate old metadata_translation flag to new individual field flags."""
+    ebook_metadata = config.get('ebook_metadata') or {}
+
+    # Check if migration needed
+    if 'metadata_translation' not in ebook_metadata:
+        return  # Nothing to migrate
+
+    # Migrate old flag to new individual field flags
+    old_value = ebook_metadata.get('metadata_translation', False)
+    if 'translate_title' not in ebook_metadata:
+        # New flags don't exist yet - create them all from old value
+        ebook_metadata['translate_title'] = old_value
+        ebook_metadata['translate_creator'] = old_value
+        ebook_metadata['translate_publisher'] = old_value
+        ebook_metadata['translate_series'] = old_value
+        ebook_metadata['translate_creator_file_as'] = old_value
+        ebook_metadata['translate_rights'] = old_value
+        ebook_metadata['translate_subject'] = old_value
+        ebook_metadata['translate_contributor'] = old_value
+        ebook_metadata['translate_description'] = old_value
+
+    # Remove old key
+    del ebook_metadata['metadata_translation']
+
+    # Save migrated config
+    config.save(ebook_metadata=ebook_metadata)

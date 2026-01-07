@@ -155,9 +155,38 @@ class Translation:
     def translate_paragraph(self, paragraph):
         if self.cancel_request():
             raise TranslationCanceled(_('Translation canceled.'))
+
+        # For ignored metadata, just copy original to translation (don't translate)
+        is_metadata = paragraph.page == 'content.opf'
+        if is_metadata and paragraph.ignored:
+            paragraph.translation = paragraph.original
+            paragraph.engine_name = self.translator.name
+            paragraph.target_lang = self.translator.get_target_lang()
+            paragraph.is_cache = False
+            return
+
         if paragraph.translation and not self.fresh:
             paragraph.is_cache = True
+            # Log cache hits for metadata/TOC
+            from .config import get_config
+            if get_config().get('log_translation', True):
+                is_toc = paragraph.page == 'toc.ncx'
+                if is_metadata:
+                    log.info('[DEBUG] ✓ Metadata from cache: "%s"' % paragraph.original[:60])
+                elif is_toc:
+                    log.info('[DEBUG] ✓ TOC from cache: "%s"' % paragraph.original[:60])
             return
+
+        # Log cache misses for metadata/TOC
+        from .config import get_config
+        if get_config().get('log_translation', True):
+            is_metadata = paragraph.page == 'content.opf'
+            is_toc = paragraph.page == 'toc.ncx'
+            if is_metadata:
+                log.warn('[DEBUG] ✗ Metadata NOT in cache, translating now: "%s"' % paragraph.original[:60])
+            elif is_toc:
+                log.info('[DEBUG] ○ TOC not in cache, translating: "%s"' % paragraph.original[:60])
+
         self.streaming('')
         self.streaming(_('Translating...'))
         text = self.glossary.replace(paragraph.original)
@@ -207,15 +236,18 @@ class Translation:
         row = paragraph.row
         original = paragraph.original.strip()
         if paragraph.error is None:
-            self.log(sep())
-            if row >= 0:
-                self.log(_('Row: {}').format(row))
-            self.log(_('Original: {}').format(original))
-            self.log(sep('┈'))
-            message = _('Translation: {}')
-            if paragraph.is_cache:
-                message = _('Translation (Cached): {}')
-            self.log(message.format(paragraph.translation.strip()))
+            # Only log verbose content if log_content setting is enabled
+            from .config import get_config
+            if get_config().get('log_content', True):
+                self.log(sep())
+                if row >= 0:
+                    self.log(_('Row: {}').format(row))
+                self.log(_('Original: {}').format(original))
+                self.log(sep('┈'))
+                message = _('Translation: {}')
+                if paragraph.is_cache:
+                    message = _('Translation (Cached): {}')
+                self.log(message.format(paragraph.translation.strip()))
 
     def handle(self, paragraphs=[]):
         start_time = time.time()
@@ -223,6 +255,15 @@ class Translation:
         for paragraph in paragraphs:
             self.total += 1
             char_count += len(paragraph.original)
+
+        # Set up prompt caching if enabled
+        # Collect full book context for caching (Claude only)
+        if hasattr(self.translator, 'enable_prompt_caching') and self.translator.enable_prompt_caching:
+            full_context = '\n\n'.join([p.original for p in paragraphs])
+            self.translator.full_book_context = full_context
+            self.log(sep())
+            self.log(_('Prompt caching enabled - using full book context'))
+            self.log(_('Context size: {} characters').format(len(full_context)))
 
         self.log(sep())
         self.log(_('Start to translate ebook content'))

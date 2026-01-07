@@ -73,7 +73,14 @@ class TestFunction(unittest.TestCase):
 
     @patch(module_name + '.get_config')
     def test_get_metadata_elements(self, mock_get_config):
-        mock_get_config.return_value.get.return_value = False
+        # Mock config to enable translation for title and subject
+        mock_config = Mock()
+        mock_config.get.return_value = {
+            'translate_title': True,
+            'translate_subject': True,
+        }
+        mock_get_config.return_value = mock_config
+
         metadata = Mock(Metadata)
         item_1 = Mock(Metadata.Item, content='a')
         item_2 = Mock(Metadata.Item, content='b')
@@ -85,13 +92,15 @@ class TestFunction(unittest.TestCase):
 
         elements = get_metadata_elements(metadata)
 
-        # Changed to get ebook_metadata dict instead of individual key
-        mock_get_config().get.assert_called_with('ebook_metadata')
+        # Metadata elements extracted for separate translation (not as paragraphs)
+        # They're marked as ignored for paragraph system but translated separately
+        mock_get_config.assert_called_once()
+        mock_config.get.assert_called_with('ebook_metadata')
         self.assertEqual(2, len(elements))
         self.assertIs(item_1, elements[0].element)
-        self.assertTrue(elements[0].ignored)
+        self.assertFalse(elements[0].ignored)  # Should be translatable (via separate system)
         self.assertIs(item_2, elements[1].element)
-        self.assertTrue(elements[1].ignored)
+        self.assertFalse(elements[1].ignored)  # Should be translatable (via separate system)
 
 
 class MockedElement(Element):

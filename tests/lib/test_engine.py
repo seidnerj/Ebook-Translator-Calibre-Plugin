@@ -96,6 +96,22 @@ class TestBase(unittest.TestCase):
         self.assertEqual(10, translator.request_timeout)
         self.assertEqual(20, translator.max_error_count)
 
+    def test_get_target_code(self):
+        MockEngine.lang_codes = {
+            'target': {'English': 'en', 'Chinese': 'zh'}}
+        self.assertEqual(
+            'en', MockEngine.get_target_code('English'))
+        self.assertEqual(
+            'zh', MockEngine.get_target_code('Chinese'))
+
+    def test_get_iso639_target_code(self):
+        MockEngine.lang_codes = {
+            'target': {'English': 'eng', 'Hebrew': 'iw'}}
+        self.assertEqual(
+            'en', MockEngine.get_iso639_target_code('English'))
+        self.assertEqual(
+            'he', MockEngine.get_iso639_target_code('Hebrew'))
+
     def test_placeholder(self):
         marks = [
             '{{id_1}}', '{id_1} }', '{{id_1}', '{ { id_1 }}', '{ { id _ 1 }']

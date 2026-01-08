@@ -7,8 +7,8 @@ from lxml import etree  # type: ignore
 from ...vendor.cssselect import SelectorError
 
 from ...lib.utils import (
-    ns, css, css_to_xpath, create_xpath, uid, trim, chunk, group, open_file,
-    request)
+    ns, css, css_to_xpath, create_xpath, uid, get_cache_id, trim, chunk, group,
+    open_file, request)
 
 
 module_name = 'calibre_plugins.ebook_translator.lib.utils'
@@ -72,6 +72,31 @@ class TestUtils(unittest.TestCase):
         self.assertEqual('202cb962ac59075b964b07152d234b70', uid('123'))
         self.assertEqual('202cb962ac59075b964b07152d234b70', uid(b'123'))
         self.assertEqual('e10adc3949ba59abbe56e057f20f883e', uid('123', '456'))
+
+    def test_get_cache_id(self):
+        # Merge length as string or integer should produce the same result.
+        self.assertEqual(
+            'a833df6d8d334f2d51acbc0004972b52',
+            get_cache_id('/path/to/file', 'test', 'en', '10'))
+        self.assertEqual(
+            'a833df6d8d334f2d51acbc0004972b52',
+            get_cache_id('/path/to/file', 'test', 'en', 10))
+
+        # UTF-8 encoding should be treated the same regardless of case.
+        self.assertEqual(
+            'a833df6d8d334f2d51acbc0004972b52',
+            get_cache_id('/path/to/file', 'test', 'en', 10))
+        self.assertEqual(
+            'a833df6d8d334f2d51acbc0004972b52',
+            get_cache_id('/path/to/file', 'test', 'en', 10, 'utf-8'))
+
+        # Encoding code with different cases should not affect the result.
+        self.assertEqual(
+            '80c2bee782b1737eb00d99bc8233e053',
+            get_cache_id('/path/to/file', 'test', 'en', 10, 'ascii'))
+        self.assertEqual(
+            '80c2bee782b1737eb00d99bc8233e053',
+            get_cache_id('/path/to/file', 'test', 'en', 10, 'ASCII'))
 
     def test_trim(self):
         self.assertEqual('abc', trim('   abc   '))

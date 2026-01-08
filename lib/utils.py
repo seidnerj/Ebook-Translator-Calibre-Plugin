@@ -69,10 +69,12 @@ def uid(*args):
     return md5.hexdigest()
 
 
-def get_cache_id(input_path, engine_name, target_lang, merge_length, encoding='utf-8'):
+def get_cache_id(
+        input_path, engine_name, target_lang, merge_length, encoding='utf-8'):
     """Calculate cache ID consistently across codebase.
 
-    Cache ID is based on: input file + engine + target language + merge length + encoding.
+    Cache ID is based on:
+    input file + engine + target language + merge length + encoding.
     This ensures separate caches for different translation configurations.
 
     Args:
@@ -87,7 +89,9 @@ def get_cache_id(input_path, engine_name, target_lang, merge_length, encoding='u
     """
     merge_length_str = str(merge_length)
     encoding_suffix = '' if encoding.lower() == 'utf-8' else encoding.lower()
-    return uid(input_path + engine_name + target_lang + merge_length_str + encoding_suffix)
+    return uid(
+        input_path + engine_name + target_lang + merge_length_str
+        +  encoding_suffix)
 
 
 def trim(text):

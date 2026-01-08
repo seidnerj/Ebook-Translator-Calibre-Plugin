@@ -2,8 +2,6 @@ import socket
 import os.path
 from typing import Any
 
-from mechanize import HTTPError
-
 from calibre.utils.localization import _, lang_as_iso639_1  # type: ignore
 
 from ..lib.utils import log, traceback_error, request, socks_proxy

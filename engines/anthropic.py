@@ -1,4 +1,5 @@
 import json
+import time
 from typing import Generator
 from urllib.parse import urljoin
 from http.client import IncompleteRead
@@ -6,7 +7,7 @@ from http.client import IncompleteRead
 from mechanize._response import response_seek_wrapper as Response
 
 from .. import EbookTranslator
-from ..lib.utils import request
+from ..lib.utils import request, log
 
 from .genai import GenAI
 from .languages import anthropic
@@ -50,6 +51,7 @@ class ClaudeTranslate(GenAI):
     enable_extended_output = False  # 128K output for Claude 3.7 Sonnet
     enable_extended_context = False  # 1M context for Claude Sonnet 4.0/4.5
     enable_dynamic_timeout = False  # Dynamic timeout based on content length
+    enable_prompt_caching = False  # Prompt caching for parallel sections with full context
 
     # event types for streaming are listed here:
     # https://docs.anthropic.com/en/api/messages-streaming
@@ -82,6 +84,9 @@ class ClaudeTranslate(GenAI):
             'enable_extended_context', self.enable_extended_context)
         self.enable_dynamic_timeout = self.config.get(
             'enable_dynamic_timeout', self.enable_dynamic_timeout)
+        self.enable_prompt_caching = self.config.get(
+            'enable_prompt_caching', self.enable_prompt_caching)
+        self.full_book_context = None  # Set externally for prompt caching
 
     def _get_prompt(self):
         prompt = self.prompt.replace('<tlang>', self.target_lang)
@@ -142,12 +147,13 @@ class ClaudeTranslate(GenAI):
 
         # Enable beta features based on user configuration
         # More info: https://platform.claude.com/docs/en/about-claude/models/overview
+        beta_features = []
+
         if self.model is not None:
             # For Claude Sonnet 3.7 - enable 128K output tokens
             # (requires user to enable this option)
             if self.enable_extended_output and self.model.startswith('claude-3-7-sonnet-'):
-                headers['anthropic-beta'] = 'output-128k-2025-02-19'
-
+                beta_features.append('output-128k-2025-02-19')
             # For Claude Sonnet 4/4.5 - enable 1M token context window
             # (requires user to enable this option)
             # More info: https://platform.claude.com/docs/en/about-claude/pricing#long-context-pricing
@@ -167,7 +173,15 @@ class ClaudeTranslate(GenAI):
             elif self.enable_extended_context and (
                     self.model.startswith('claude-sonnet-4-0') or
                     self.model.startswith('claude-sonnet-4-5')):
-                headers['anthropic-beta'] = 'context-1m-2025-08-07'
+                beta_features.append('context-1m-2025-08-07')
+
+        # Prompt caching can be used with any Claude model
+        # More info: https://platform.claude.com/docs/en/build-with-claude/prompt-caching
+        if self.enable_prompt_caching:
+            beta_features.append('prompt-caching-2024-07-31')
+
+        if beta_features:
+            headers['anthropic-beta'] = ','.join(beta_features)
 
         return headers
 
@@ -212,13 +226,35 @@ class ClaudeTranslate(GenAI):
         # Minimum 4096 tokens
         max_tokens = max(max_tokens, 4_096)
 
+        # Build system message with optional caching
+        if self.enable_prompt_caching and self.full_book_context:
+            # Use full book context as cached system message
+            # More info: https://platform.claude.com/docs/en/build-with-claude/prompt-caching
+            system_content = [
+                {
+                    "type": "text",
+                    "text": self._get_prompt()
+                },
+                {
+                    "type": "text",
+                    "text": "Full book context for reference:\n\n" + self.full_book_context,
+                    "cache_control": {"type": "ephemeral"}
+                }
+            ]
+            # Add instruction to translate only this section
+            user_message = f"Translate only the following section:\n\n{text}"
+        else:
+            # Standard system message without caching
+            system_content = self._get_prompt()
+            user_message = text
+
         body = {
             'stream': self.stream,
             'max_tokens': max_tokens,
             'model': self.model,
             'top_k': self.top_k,
-            'system': self._get_prompt(),
-            'messages': [{'role': 'user', 'content': text}]
+            'system': system_content,
+            'messages': [{'role': 'user', 'content': user_message}]
         }
         sampling_value = getattr(self, self.sampling)
         body.update({self.sampling: sampling_value})
@@ -265,11 +301,116 @@ class ClaudeTranslate(GenAI):
                         .format(chunk['error']['message']))
 
 
-class ClaudeBatchTranslate:
-    """TODO: use the message batches api (currently only the streaming api can
-    be used). The message batches api allows sending any number of batches of
-    up to 100,000 messages per batch. Batches are processed asynchronously with
-    results returned as soon as the batch is complete and cost 50% less than
-    standard API calls (more info here:
-    https://docs.anthropic.com/en/docs/build-with-claude/message-batches)
+class ClaudeBatchTranslate(ClaudeTranslate):
+    """Message Batches API for asynchronous bulk translation with 50% cost reduction.
+
+    The message batches API allows sending batches of up to 100,000 messages.
+    Batches are processed asynchronously with results returned when complete.
+    Costs 50% less than standard API calls.
+
+    Combined with prompt caching, offers up to 84% total cost savings.
+    Trade-off: Processing takes up to 24 hours (most <1 hour) vs immediate results.
+
+    More info: https://docs.anthropic.com/en/docs/build-with-claude/message-batches
     """
+
+    name = 'Claude Batch'
+    alias = 'Claude Batch (Anthropic)'
+
+    # Batch-specific settings
+    stream = False  # Batches don't support streaming
+    batch_poll_interval = 60.0  # Poll every 60 seconds
+
+    def __init__(self):
+        super().__init__()
+        # Batch API uses different endpoints
+        self.batch_endpoint = 'https://api.anthropic.com/v1/messages/batches'
+        self.batch_poll_interval = self.config.get('batch_poll_interval', self.batch_poll_interval)
+
+    def create_batch_request(self, custom_id, text):
+        """Create a single request object for batch API."""
+        # Parse the body that get_body() creates
+        body_json = json.loads(self.get_body(text))
+        # Remove stream parameter (not supported in batches)
+        body_json.pop('stream', None)
+
+        return {
+            'custom_id': custom_id,
+            'params': body_json
+        }
+
+    def create_batch(self, requests):
+        """Submit a batch of translation requests."""
+        batch_body = json.dumps({'requests': requests})
+        response = request(
+            self.batch_endpoint,
+            data=batch_body,
+            headers=self.get_headers(),
+            method='POST',
+            timeout=int(self.request_timeout),
+            proxy_uri=self.proxy_uri if self.proxy_type == 'http' else None
+        )
+        batch = json.loads(response)
+        return batch['id']
+
+    def poll_batch(self, batch_id):
+        """Poll batch status until completion."""
+        while True:
+            response = request(
+                f'{self.batch_endpoint}/{batch_id}',
+                headers=self.get_headers(),
+                timeout=int(self.request_timeout),
+                proxy_uri=self.proxy_uri if self.proxy_type == 'http' else None
+            )
+            batch = json.loads(response)
+
+            if batch['processing_status'] == 'ended':
+                return batch
+
+            # Log progress
+            counts = batch['request_counts']
+            log.info(f"Batch {batch_id}: {counts['succeeded']}/{counts['processing']} completed")
+
+            time.sleep(self.batch_poll_interval)
+
+    def get_batch_results(self, results_url):
+        """Retrieve and parse batch results."""
+        response = request(
+            results_url,
+            headers=self.get_headers(),
+            timeout=int(self.request_timeout),
+            proxy_uri=self.proxy_uri if self.proxy_type == 'http' else None
+        )
+
+        # Results are in JSONL format (one JSON object per line)
+        results = {}
+        for line in response.decode('utf-8').strip().split('\n'):
+            if line:
+                result = json.loads(line)
+                custom_id = result['custom_id']
+                if result['result']['type'] == 'succeeded':
+                    message = result['result']['message']
+                    translation = message['content'][0]['text']
+                    results[custom_id] = translation
+                else:
+                    # Handle errors
+                    error_type = result['result'].get('error', {}).get('type', 'unknown')
+                    raise Exception(f"Batch request {custom_id} failed: {error_type}")
+
+        return results
+
+    def translate(self, content):
+        """Override translate to use batch API."""
+        # For single paragraph translation, create a single-item batch
+        batch_request = self.create_batch_request('translation-0', content)
+        batch_id = self.create_batch([batch_request])
+
+        log.info(f'Created batch {batch_id}, polling for completion...')
+        batch = self.poll_batch(batch_id)
+
+        if batch['results_url']:
+            results = self.get_batch_results(batch['results_url'])
+            return results.get('translation-0', '')
+        else:
+            raise Exception('Batch completed but no results URL provided')
+

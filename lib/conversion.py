@@ -520,8 +520,6 @@ def convert_item(
         translator.placeholder, translator.separator, direction)
     element_handler.set_translation_lang(
         translator.get_iso639_target_code(target_lang))
-    element_handler.set_source_lang(
-        translator.get_source_code(translator.source_lang))
 
     from .utils import get_cache_id
     merge_length = element_handler.get_merge_length()
@@ -622,48 +620,6 @@ class ConversionWorker:
                 metadata = get_metadata(file, ebook.output_format)
                 log.info('Read metadata from file: title=%s, authors=%s, publisher=%s, series=%s' % (
                     metadata.title, metadata.authors, metadata.publisher, metadata.series))
-
-                # Add RTL/LTR metadata to OPF if directions differ
-                # Do this by directly modifying the EPUB's content.opf file
-                from lxml import etree
-                from ..engines.languages import lang_directionality
-
-                translator = get_translator()
-                source_lang_code = translator.get_source_code(ebook.source_lang)
-                source_lang_base = source_lang_code.split('-')[0] if source_lang_code else None
-                source_direction = lang_directionality.get(source_lang_code,
-                                                          lang_directionality.get(source_lang_base, 'ltr'))
-                target_direction = ebook.target_direction.lower() if ebook.target_direction else None
-
-                if target_direction in ('rtl', 'ltr') and source_direction != target_direction:
-                    try:
-                        from calibre.ebooks.oeb.polish.container import get_container
-                        from lxml import etree
-
-                        writing_mode = 'horizontal-rl' if target_direction == 'rtl' else 'horizontal-lr'
-
-                        # Use Calibre's polish Container for efficient EPUB modification
-                        container = get_container(output_path, tweak_mode=True)
-                        opf_root = container.opf
-
-                        # Add primary-writing-mode meta
-                        ns = {'opf': 'http://www.idpf.org/2007/opf'}
-                        metadata_elem = opf_root.xpath('//opf:metadata', namespaces=ns)[0]
-                        etree.SubElement(metadata_elem, '{http://www.idpf.org/2007/opf}meta',
-                                        attrib={'name': 'primary-writing-mode', 'content': writing_mode})
-
-                        # Set spine page-progression-direction
-                        spine_elem = opf_root.xpath('//opf:spine', namespaces=ns)[0]
-                        spine_elem.set('page-progression-direction', target_direction)
-
-                        # Commit changes - Container efficiently updates only the OPF file in ZIP
-                        container.dirty(container.opf_name)
-                        container.commit()
-
-                        log.info('Added RTL metadata: primary-writing-mode=%s, page-progression-direction=%s' %
-                                (writing_mode, target_direction))
-                    except Exception as e:
-                        log.warn('Failed to add RTL metadata to EPUB: %s' % e)
 
                 ebook_title = metadata.title
                 if ebook.custom_title is not None:

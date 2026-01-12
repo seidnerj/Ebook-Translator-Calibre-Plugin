@@ -74,6 +74,43 @@ def convert_book(
         translation.handle(paragraphs)
         element_handler.add_translations(paragraphs)
 
+        # Add RTL/LTR OPF metadata if source and target directions differ
+        if element_handler.source_lang and element_handler.target_direction in ('rtl', 'ltr'):
+            from lxml import etree
+            from ..engines.languages import lang_directionality
+
+            source_direction = lang_directionality.get(element_handler.source_lang, 'ltr')
+
+            # Only add metadata if directions differ
+            if source_direction != element_handler.target_direction:
+                direction = element_handler.target_direction
+                log.info('Source direction (%s) differs from target direction (%s), adding %s metadata...' %
+                         (source_direction, direction, direction.upper()))
+
+                # Add rendition:primary-writing-mode meta tag
+                try:
+                    if hasattr(oeb, 'metadata'):
+                        # EPUB3 rendition namespace
+                        meta_elem = etree.Element(
+                            '{http://www.idpf.org/2007/opf}meta',
+                            attrib={'property': 'rendition:primary-writing-mode'}
+                        )
+                        meta_elem.text = direction
+                        oeb.metadata.append(meta_elem)
+                        log.info('Added primary-writing-mode=%s to OPF metadata' % direction)
+                except Exception as e:
+                    log.warn('Failed to add primary-writing-mode: %s' % e)
+
+                # Set page-progression-direction on spine
+                try:
+                    if hasattr(oeb, 'spine'):
+                        spine_elem = oeb.spine
+                        if hasattr(spine_elem, 'set'):
+                            spine_elem.set('page-progression-direction', direction)
+                            log.info('Set spine page-progression-direction=%s' % direction)
+                except Exception as e:
+                    log.warn('Failed to set page-progression-direction: %s' % e)
+
         log.info(sep())
         log.info(_('Start to convert ebook format...'))
         log.info(sep())
@@ -201,6 +238,8 @@ def convert_item(
         translator.placeholder, translator.separator, direction)
     element_handler.set_translation_lang(
         translator.get_iso639_target_code(target_lang))
+    element_handler.set_source_lang(
+        translator.get_source_code(translator.source_lang))
 
     merge_length = str(element_handler.get_merge_length())
     _encoding = ''

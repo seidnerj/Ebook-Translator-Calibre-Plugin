@@ -63,6 +63,9 @@ class Element:
     def set_target_direction(self, direction):
         self.target_direction = direction
 
+    def set_source_lang(self, lang):
+        self.source_lang = lang
+
     def set_translation_lang(self, lang):
         self.translation_lang = lang
 
@@ -643,6 +646,7 @@ class ElementHandler:
 
         self.merge_length = 0
         self.target_direction = None
+        self.source_lang = None
 
         self.translation_lang = None
         self.original_color = None
@@ -663,6 +667,9 @@ class ElementHandler:
 
     def set_target_direction(self, direction):
         self.target_direction = direction
+
+    def set_source_lang(self, lang):
+        self.source_lang = lang
 
     def set_translation_lang(self, lang):
         self.translation_lang = lang

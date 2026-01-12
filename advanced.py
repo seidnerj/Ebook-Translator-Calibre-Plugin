@@ -6,7 +6,7 @@ from qt.core import (  # type: ignore
     QPlainTextEdit, QPushButton, QSplitter, QLabel, QThread, QLineEdit,
     QGridLayout, QProgressBar, pyqtSignal, pyqtSlot, QPixmap, QEvent,
     QStackedWidget, QSpacerItem, QTabWidget, QCheckBox,
-    QComboBox, QSizePolicy)
+    QComboBox, QSizePolicy, QTextCursor)
 from calibre.constants import __version__  # type: ignore
 from calibre.gui2 import I  # type: ignore
 from calibre.utils.localization import _  # type: ignore
@@ -17,9 +17,10 @@ from .lib.config import get_config
 from .lib.encodings import encoding_list
 from .lib.cache import Paragraph, get_cache
 from .lib.translation import get_engine_class, get_translator, get_translation
-from .lib.element import get_element_handler
+from .lib.element import get_element_handler, MetadataElement, TocElement, PageElement
 from .lib.conversion import extract_item, extra_formats
 from .engines.openai import ChatgptTranslate, ChatgptBatchTranslate
+from .engines.anthropic import ClaudeTranslate
 from .engines.custom import CustomTranslate
 from .components import (
     EngineList, Footer, SourceLang, TargetLang, InputFormat, OutputFormat,
@@ -63,7 +64,7 @@ class PreparationWorker(QObject):
 
     def __init__(self, engine_class, ebook):
         QObject.__init__(self)
-        self.engine_class = engine_class
+        self.current_engine = engine_class
         self.ebook = ebook
 
         self.on_working = False
@@ -88,22 +89,19 @@ class PreparationWorker(QObject):
         self.on_working = True
         input_path = self.ebook.get_input_path()
         element_handler = get_element_handler(
-            self.engine_class.placeholder, self.engine_class.separator,
+            self.current_engine.placeholder, self.current_engine.separator,
             self.ebook.target_direction)
-        merge_length = str(element_handler.get_merge_length())
-        encoding = ''
-        if self.ebook.encoding.lower() != 'utf-8':
-            encoding = self.ebook.encoding.lower()
-        cache_id = uid(
-            input_path + self.engine_class.name + self.ebook.target_lang
-            + merge_length + encoding)
+        from .lib.utils import get_cache_id
+        merge_length = element_handler.get_merge_length()
+        cache_id = get_cache_id(input_path, self.current_engine.name, self.ebook.target_lang,
+                                merge_length, self.ebook.encoding)
         cache = get_cache(cache_id)
 
         if cache.is_fresh() or not cache.is_persistence():
             self.progress_detail.emit(
                 'Start processing the ebook: %s' % self.ebook.title)
             cache.set_info('title', self.ebook.title)
-            cache.set_info('engine_name', self.engine_class.name)
+            cache.set_info('engine_name', self.current_engine.name)
             cache.set_info('target_lang', self.ebook.target_lang)
             cache.set_info('merge_length', merge_length)
             cache.set_info('plugin_version', EbookTranslator.__version__)
@@ -134,7 +132,39 @@ class PreparationWorker(QObject):
                 return
             # --------------------------
             self.progress_message.emit(_('Filtering ebook content...'))
-            original_group = element_handler.prepare_original(elements)
+
+            # Separate metadata, TOC, and content (same logic as convert_book)
+            from .lib.utils import uid
+            metadata_elements = [e for e in elements if isinstance(e, MetadataElement)]
+            toc_elements = [e for e in elements if isinstance(e, TocElement)]
+            page_elements = [e for e in elements if isinstance(e, PageElement)]
+
+            # Store metadata originals directly (not merged)
+            # Only store ENABLED metadata fields (ignored ones don't appear in UI)
+            metadata_originals = []
+            for eid, metadata_elem in enumerate(metadata_elements):
+                if metadata_elem.ignored:
+                    continue  # Skip disabled metadata fields
+
+                original_value = metadata_elem.get_content()
+                item_id = -(eid + 1)  # Use negative IDs to avoid conflicts
+                md5 = uid('metadata_%s%s' % (eid, original_value))
+                metadata_originals.append((item_id, md5, original_value, original_value,
+                                          False, None, 'content.opf'))
+
+            # Store TOC as single merged entry
+            toc_originals = []
+            if toc_elements:
+                toc_texts = [toc.get_content() for toc in toc_elements if not toc.ignored]
+                if toc_texts:
+                    merged_toc = '\n\n'.join(toc_texts)
+                    toc_id = 'toc_merged'
+                    md5 = uid('toc_%s' % merged_toc)
+                    toc_originals.append((toc_id, md5, merged_toc, merged_toc, False, None, 'toc.ncx'))
+
+            # Prepare content/pages only (may be merged)
+            content_originals = element_handler.prepare_original(page_elements)
+
             self.progress.emit(80)
             c = time.time()
             self.progress_detail.emit('filtering timing: %s' % (c - b))
@@ -143,7 +173,14 @@ class PreparationWorker(QObject):
                 return
             # --------------------------
             self.progress_message.emit(_('Preparing user interface...'))
-            cache.save(original_group)
+
+            # Save all: metadata + TOC + content
+            cache.save(content_originals)
+            for metadata_item in metadata_originals:
+                cache.add(*metadata_item)
+            for toc_item in toc_originals:
+                cache.add(*toc_item)
+            cache.connection.commit()
             self.progress.emit(100)
             d = time.time()
             self.progress_detail.emit('cache timing: %s' % (d - c))
@@ -173,7 +210,7 @@ class TranslationWorker(QObject):
         QObject.__init__(self)
         self.source_lang = ebook.source_lang
         self.target_lang = ebook.target_lang
-        self.engine_class = engine_class
+        self.current_engine = engine_class
 
         self.on_working = False
         self.canceled = False
@@ -188,7 +225,7 @@ class TranslationWorker(QObject):
         self.target_lang = lang
 
     def set_engine_class(self, engine_class):
-        self.engine_class = engine_class
+        self.current_engine = engine_class
 
     def set_canceled(self, canceled):
         self.canceled = canceled
@@ -204,7 +241,7 @@ class TranslationWorker(QObject):
         """:fresh: retranslate all paragraphs."""
         self.on_working = True
         self.start.emit()
-        translator = get_translator(self.engine_class)
+        translator = get_translator(self.current_engine)
         translator.set_source_lang(self.source_lang)
         translator.set_target_lang(self.target_lang)
         translation = get_translation(translator)
@@ -447,13 +484,33 @@ class AdvancedTranslation(QDialog):
             merge_length = self.cache.get_info('merge_length') or 0
             self.merge_enabled = int(merge_length) > 0
             paragraphs = self.cache.all_paragraphs()
-            if len(paragraphs) < 1:
+
+            # Metadata and TOC are already in cache with page='content.opf' and page='toc.ncx'
+            # No need to fetch separately - they're loaded with all_paragraphs()
+            metadata_count = len([p for p in paragraphs if p.page == 'content.opf'])
+            toc_count = len([p for p in paragraphs if p.page == 'toc.ncx'])
+            content_count = len([p for p in paragraphs if p.page not in ('content.opf', 'toc.ncx')])
+
+            from .lib.utils import log
+            from .lib.config import get_config
+            config = get_config()
+            if config.get('log_translation', True):
+                log.info('[ADVANCED UI] Loaded from cache: %d metadata, %d TOC, %d content, %d total' %
+                        (metadata_count, toc_count, content_count, len(paragraphs)))
+                # Log first few items to debug
+                for i, p in enumerate(paragraphs[:15]):
+                    log.info('[ADVANCED UI]   Item %d: page=%s, original="%s"' %
+                            (i, p.page or 'None', p.original[:50]))
+
+            all_items = paragraphs
+
+            if len(all_items) < 1:
                 self.alert.pop(
                     _('There is no content that needs to be translated.'),
                     'warning')
                 self.done(0)
                 return
-            self.table = AdvancedTranslationTable(self, paragraphs)
+            self.table = AdvancedTranslationTable(self, all_items)
             self.panel = self.layout_panel()
             self.stack.addWidget(self.panel)
             self.stack.setCurrentWidget(self.panel)
@@ -973,6 +1030,7 @@ class AdvancedTranslation(QDialog):
         self.review_splitter.setSizes(_size)
 
         def synchronizeScrollbars(editors):
+            """Sync scrollbars between editors using simple pixel-based approach."""
             for editor in editors:
                 for other_editor in editors:
                     if editor != other_editor:
@@ -1113,6 +1171,23 @@ class AdvancedTranslation(QDialog):
         self.table.row.connect(update_translation_status)
 
         def change_selected_item():
+            # TODO: Allow viewing chunk details during translation
+            # Current limitation: Blocks all selection changes during translation to prevent
+            # data corruption with concurrent/streaming translation.
+            #
+            # Problem: With concurrency > 1, multiple paragraphs stream in parallel.
+            # If user clicks paragraph N while paragraph M is streaming, M's chunks would
+            # get inserted into N's view (data corruption). With single-threaded streaming,
+            # we could track current_streaming_row and discard mismatched chunks, but
+            # concurrent signals from multiple threads interleave unpredictably.
+            #
+            # Potential solutions:
+            # 1. Track streaming state per paragraph (dict[row, is_streaming])
+            # 2. Tag each streaming chunk with paragraph row in the signal
+            # 3. Buffer streaming chunks and only insert when paragraph matches
+            # 4. Disable concurrent translation when streaming is enabled
+            #
+            # For now, maintain original guard to prevent corruption.
             if self.trans_worker.on_working:
                 return
             paragraph = self.table.current_paragraph()
@@ -1139,7 +1214,32 @@ class AdvancedTranslation(QDialog):
             elif isinstance(data, Paragraph):
                 self.table.setCurrentItem(self.table.item(data.row, 0))
             else:
-                translation_text.insertPlainText(data)
+                # Streaming text chunk
+                # Check if user is at bottom (watching stream)
+                scrollbar = translation_text.verticalScrollBar()
+                was_at_bottom = scrollbar.value() >= scrollbar.maximum() - 10
+
+                # Disable updates to prevent auto-scroll/flicker
+                translation_text.setUpdatesEnabled(False)
+                saved_position = scrollbar.value()
+
+                # Append to document using cursor at end
+                doc = translation_text.document()
+                cursor = QTextCursor(doc)
+                end_position = getattr(QTextCursor.MoveOperation, 'End', None) or QTextCursor.End
+                cursor.movePosition(end_position)
+                cursor.insertText(data)
+
+                # Restore scroll position before re-enabling updates
+                if not was_at_bottom:
+                    scrollbar.setValue(saved_position)
+
+                # Re-enable updates - this triggers repaint
+                translation_text.setUpdatesEnabled(True)
+
+                # Scroll to bottom only if user was watching
+                if was_at_bottom:
+                    scrollbar.setValue(scrollbar.maximum())
         self.trans_worker.streaming.connect(streaming_translation)
 
         def modify_translation():
@@ -1216,6 +1316,56 @@ class AdvancedTranslation(QDialog):
     def get_progress_step(self, total):
         return int(round(100.0 / (total or 1), 100) * 1000000)
 
+    def check_max_tokens_capacity(self):
+        """Check if merge length might exceed model's max output tokens."""
+        if not issubclass(self.current_engine, ClaudeTranslate):
+            return True  # Only check for Claude models
+
+        config = get_config()
+        merge_length = config.get('merge_length', 1800)
+        merge_enabled = config.get('merge_enabled', False)
+
+        if not merge_enabled:
+            return True  # No merge, chunks will be small
+
+        # Get model and settings from engine
+        engine_config = self.current_engine.config
+        model = engine_config.get('model', self.current_engine.model)
+        enable_extended_output = engine_config.get('enable_extended_output', False)
+
+        # Estimate output tokens (conservative: 3 chars per token, +10% buffer)
+        estimated_output_tokens = int((merge_length / 3) * 1.1)
+
+        # Determine model's max output (same logic as in anthropic.py get_body)
+        if not model:
+            model_max_output = 4_096
+        elif model.startswith('claude-3-7-sonnet-') and enable_extended_output:
+            model_max_output = 128_000
+        elif model.startswith('claude-3-7-sonnet-'):
+            model_max_output = 64_000
+        elif model.startswith('claude-sonnet-4-') or model.startswith('claude-haiku-4-') or \
+             model.startswith('claude-opus-4-5') or model.startswith('claude-opus-4-1'):
+            model_max_output = 64_000
+        elif model.startswith('claude-opus-4-0'):
+            model_max_output = 32_000
+        elif model.startswith('claude-3-haiku-'):
+            model_max_output = 4_000
+        else:
+            model_max_output = 32_000
+
+        # Check if estimated output exceeds model capacity
+        if estimated_output_tokens > model_max_output:
+            message = _(
+                'Warning: Merge length ({:,} chars ≈ {:,} tokens) may exceed model max output ({:,} tokens).\n\n'
+                'This could result in incomplete translations. Consider:\n'
+                '• Reducing merge length\n'
+                '• Enabling "Extended Output" (Claude 3.7 Sonnet: 128K tokens)\n\n'
+                'Continue anyway?'
+            ).format(merge_length, estimated_output_tokens, model_max_output)
+            return self.alert.ask(message) == 'yes'
+
+        return True
+
     def translate_all_paragraphs(self):
         """Translate the untranslated paragraphs when at least one is selected.
         Otherwise, retranslate all paragraphs regardless of prior translation.
@@ -1225,6 +1375,11 @@ class AdvancedTranslation(QDialog):
         if is_fresh:
             paragraphs = self.table.get_selected_paragraphs(False, True)
         self.progress_step = self.get_progress_step(len(paragraphs))
+
+        # Check max_tokens capacity before starting
+        if not self.check_max_tokens_capacity():
+            return
+
         if not self.translate_all:
             message = _(
                 'Are you sure you want to translate all {:n} paragraphs?')
@@ -1239,6 +1394,9 @@ class AdvancedTranslation(QDialog):
         if len(paragraphs) == self.table.rowCount():
             self.translate_all_paragraphs()
         else:
+            # Check max_tokens capacity before starting
+            if not self.check_max_tokens_capacity():
+                return
             self.progress_step = self.get_progress_step(len(paragraphs))
             self.trans_worker.translate.emit(paragraphs, True)
 

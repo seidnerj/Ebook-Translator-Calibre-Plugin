@@ -31,9 +31,9 @@ class AdvancedTranslationTable(QTableWidget):
 
     def layout(self):
         self.setRowCount(len(self.paragraphs))
-        self.setColumnCount(4)
+        self.setColumnCount(5)
         self.setHorizontalHeaderLabels(
-            [_('Original'), _('Engine'), _('Language'), _('Status')])
+            [_('Type'), _('Original'), _('Engine'), _('Language'), _('Status')])
         self.verticalHeader().setMinimumWidth(28)
         self.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -51,43 +51,60 @@ class AdvancedTranslationTable(QTableWidget):
             vheader.setTextAlignment(Qt.AlignCenter)
             self.setVerticalHeaderItem(row, vheader)
 
+            metadata_col = QTableWidgetItem()
+            metadata_col.setTextAlignment(Qt.AlignCenter)
+            metadata_col.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+            metadata_col.setData(Qt.UserRole, paragraph)  # Store paragraph in first column
             original = QTableWidgetItem()
             original.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
-            original.setData(Qt.UserRole, paragraph)
             engine_name = QTableWidgetItem()
             engine_name.setTextAlignment(Qt.AlignCenter)
             traget_lang = QTableWidgetItem()
             traget_lang.setTextAlignment(Qt.AlignCenter)
             status = QTableWidgetItem()
             status.setTextAlignment(Qt.AlignCenter)
-            self.setItem(row, 0, original)
-            self.setItem(row, 1, engine_name)
-            self.setItem(row, 2, traget_lang)
-            self.setItem(row, 3, status)
+            self.setItem(row, 0, metadata_col)
+            self.setItem(row, 1, original)
+            self.setItem(row, 2, engine_name)
+            self.setItem(row, 3, traget_lang)
+            self.setItem(row, 4, status)
 
             self.track_row_data(row)
 
         header = self.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)  # Original column stretches
 
     def track_row_data(self, row):
         paragraph = self.paragraph(row)
         original = paragraph.original.replace('\n', ' ')
         engine_name = paragraph.engine_name
         target_lang = paragraph.target_lang
-        items = [original, '--', '--', _('Untranslated')]
+
+        # Check type based on page
+        is_metadata = paragraph.page == 'content.opf'
+        is_toc = paragraph.page == 'toc.ncx'
+        type_indicator = ''
+        if is_metadata:
+            type_indicator = 'Metadata'
+        elif is_toc:
+            type_indicator = 'TOC'
+
+        items = [type_indicator, original, '--', '--', _('Untranslated')]
         if paragraph.translation:
-            before_aligned = paragraph.aligned
-            if self.parent.merge_enabled:
-                self.check_line_alignment(paragraph)
-            # If the alignment of before and after is the same, do nothing.
-            if before_aligned and not paragraph.aligned:
-                self.non_aligned_count += 1
-            elif not before_aligned and paragraph.aligned:
-                self.non_aligned_count -= 1
-            items = [original, engine_name, target_lang, _('Translated')]
+            if not is_metadata and not is_toc:
+                # Only check alignment for content, not metadata/TOC
+                before_aligned = paragraph.aligned
+                if self.parent.merge_enabled:
+                    self.check_line_alignment(paragraph)
+                # If the alignment of before and after is the same, do nothing.
+                if before_aligned and not paragraph.aligned:
+                    self.non_aligned_count += 1
+                elif not before_aligned and paragraph.aligned:
+                    self.non_aligned_count -= 1
+            items = [type_indicator, original, engine_name, target_lang, _('Translated')]
         else:
-            self.check_translation_error(paragraph)
+            if not is_metadata and not is_toc:
+                self.check_translation_error(paragraph)
         for column, text in enumerate(items):
             item = self.item(row, column)
             item.setText(text)

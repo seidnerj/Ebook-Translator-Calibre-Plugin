@@ -37,6 +37,7 @@ class Element:
 
         self.position = None
         self.target_direction = None
+        self.source_lang = None
         self.translation_lang = None
         self.original_color = None
         self.translation_color = None
@@ -61,6 +62,9 @@ class Element:
 
     def set_target_direction(self, direction):
         self.target_direction = direction
+
+    def set_source_lang(self, lang):
+        self.source_lang = lang
 
     def set_translation_lang(self, lang):
         self.translation_lang = lang
@@ -262,13 +266,43 @@ class PageElement(Element):
         new_element.set('dir', self.target_direction or 'auto')
         if self.translation_lang is not None:
             new_element.set('lang', self.translation_lang)
+
+        # Build style attribute with color and conditional text-align
+        style_parts = []
         if self.translation_color is not None:
-            new_element.set('style', 'color:%s' % self.translation_color)
+            style_parts.append('color:%s' % self.translation_color)
+
+        # Add text-align only if source and target directions differ
+        if self.source_lang and self.target_direction in ('rtl', 'ltr'):
+            # Import to get directionality function
+            from ..engines.languages import lang_directionality
+            source_direction = lang_directionality.get(self.source_lang, 'ltr')
+
+            # Only add text-align if directions differ
+            if source_direction != self.target_direction:
+                if self.target_direction == 'rtl':
+                    style_parts.append('text-align:right')
+                elif self.target_direction == 'ltr':
+                    style_parts.append('text-align:left')
+
+        if style_parts:
+            new_element.set('style', ';'.join(style_parts))
+
         return new_element
 
     def add_translation(self, translation=None):
         # self.element.tail = None  # Make sure the element has no tail
-        if self.original_color is not None:
+        if self.original_color is not None or (self.source_lang and self.target_direction in ('rtl', 'ltr')):
+            # Check if text-align should be added (only if directions differ)
+            add_text_align = False
+            text_align_value = None
+            if self.source_lang and self.target_direction in ('rtl', 'ltr'):
+                from ..engines.languages import lang_directionality
+                source_direction = lang_directionality.get(self.source_lang, 'ltr')
+                if source_direction != self.target_direction:
+                    add_text_align = True
+                    text_align_value = 'right' if self.target_direction == 'rtl' else 'left'
+
             for element in self.element.iter():
                 if element.text is not None or len(list(element)) > 0:
                     # Some users encountered errors when trying to set the
@@ -278,7 +312,13 @@ class PageElement(Element):
                     # since comment and processing instruction nodes do not
                     # have string tags, e.g., etree.Comment and etree.PI.
                     try:
-                        element.set('style', 'color:%s' % self.original_color)
+                        style_parts = []
+                        if self.original_color is not None:
+                            style_parts.append('color:%s' % self.original_color)
+                        if add_text_align:
+                            style_parts.append('text-align:%s' % text_align_value)
+                        if style_parts:
+                            element.set('style', ';'.join(style_parts))
                     except TypeError:
                         log.warn(
                             'Failed to set style on element:',
@@ -642,6 +682,7 @@ class ElementHandler:
 
         self.merge_length = 0
         self.target_direction = None
+        self.source_lang = None
 
         self.translation_lang = None
         self.original_color = None
@@ -662,6 +703,9 @@ class ElementHandler:
 
     def set_target_direction(self, direction):
         self.target_direction = direction
+
+    def set_source_lang(self, lang):
+        self.source_lang = lang
 
     def set_translation_lang(self, lang):
         self.translation_lang = lang
@@ -694,6 +738,7 @@ class ElementHandler:
             element.set_placeholder(self.placeholder)
             element.set_position(self.position)
             element.set_target_direction(self.target_direction)
+            element.set_source_lang(self.source_lang)
             element.set_translation_lang(self.translation_lang)
             element.set_original_color(self.original_color)
             element.set_translation_color(self.translation_color)
@@ -750,6 +795,7 @@ class ElementHandlerMerge(ElementHandler):
             element.set_placeholder(self.placeholder)
             element.set_position(self.position)
             element.set_target_direction(self.target_direction)
+            element.set_source_lang(self.source_lang)
             element.set_translation_lang(self.translation_lang)
             element.set_original_color(self.original_color)
             element.set_translation_color(self.translation_color)
@@ -836,24 +882,88 @@ def get_pgn_elements(path, encoding):
 
 
 def get_metadata_elements(metadata):
+    """Extract metadata elements for separate translation (not as paragraphs).
+
+    Metadata is translated individually and cached in info table, not paragraph table.
+    Each field is displayed separately in UI, not mixed with content paragraphs.
+
+    Extracts all 9 metadata fields:
+    - title (dc:title)
+    - creator (dc:creator)
+    - publisher (dc:publisher)
+    - series (calibre:series)
+    - author_sort (calibre:author_sort / opf:file-as)
+    - rights (dc:rights)
+    - subject (dc:subject)
+    - contributor (dc:contributor)
+    - description (dc:description)
+
+    Each field respects individual translation settings from config.
+    """
     config = get_config()
-    enable_translation = config.get(
-        'ebook_metadata.metadata_translation', False)
+    metadata_config = config.get('ebook_metadata') or {}
+
+    # Get individual field translation flags
+    translate_title = metadata_config.get('translate_title', False)
+    translate_creator = metadata_config.get('translate_creator', False)
+    translate_publisher = metadata_config.get('translate_publisher', False)
+    translate_series = metadata_config.get('translate_series', False)
+    translate_rights = metadata_config.get('translate_rights', False)
+    translate_subject = metadata_config.get('translate_subject', False)
+    translate_contributor = metadata_config.get('translate_contributor', False)
+    translate_description = metadata_config.get('translate_description', False)
+
+    # title_sort and author_sort follow their parent fields (no separate settings)
+    translate_title_sort = translate_title
+    translate_author_sort = translate_creator
+
+    # Backward compatibility: check old 'metadata_translation' key
+    old_translate_all = metadata_config.get('metadata_translation', False)
+    if old_translate_all and not any([translate_title, translate_creator, translate_publisher]):
+        # Migrate old setting: enable common fields
+        translate_title = translate_creator = translate_publisher = True
+
     elements = []
-    names = (
-        'title', 'creator', 'publisher', 'rights', 'subject', 'contributor',
-        'description')
+    # Include series, title_sort, and author_sort (Calibre-specific fields)
+    names = ('title', 'title_sort', 'creator', 'author_sort', 'publisher', 'series', 'rights', 'subject', 'contributor', 'description')
     pattern = re.compile(r'[a-zA-Z]+')
+
     for key in metadata.iterkeys():
         if key not in names:
             continue
         items = getattr(metadata, key)
+
+        # Determine if this field should be translated
+        should_translate = False
+        if key == 'title' and translate_title:
+            should_translate = True
+        elif key == 'creator' and translate_creator:
+            should_translate = True
+        elif key == 'publisher' and translate_publisher:
+            should_translate = True
+        elif key == 'series' and translate_series:
+            should_translate = True
+        elif key == 'title_sort' and translate_title_sort:
+            should_translate = True
+        elif key == 'author_sort' and translate_author_sort:
+            should_translate = True
+        elif key == 'rights' and (translate_rights or old_translate_all):
+            should_translate = True
+        elif key == 'subject' and (translate_subject or old_translate_all):
+            should_translate = True
+        elif key == 'contributor' and (translate_contributor or old_translate_all):
+            should_translate = True
+        elif key == 'description' and (translate_description or old_translate_all):
+            should_translate = True
+
         for item in items:
             if pattern.search(item.content) is None:
                 continue
+            # Store element reference for translation, but mark ignored for paragraph system
             element = MetadataElement(
-                item, page_id='content.opf', ignored=not enable_translation)
+                item, page_id='content.opf', ignored=not should_translate)
             elements.append(element)
+
     return elements
 
 

@@ -19,9 +19,12 @@ class TestConversionWorker(unittest.TestCase):
         self.worker.api = Mock()
 
         self.ebook = Mock(Ebook)
+        self.ebook.output_format = 'epub'
+        self.ebook.source_lang = 'English'
+        self.ebook.target_direction = None
         self.job = Mock()
         self.worker.working_jobs = {
-            self.job: (self.ebook, str(Path('/path/to/test.epub')))}
+            self.job: (self.ebook, str(Path('/path/to/test.epub')), False)}
 
     def test_create_worker(self):
         self.assertIsInstance(self.worker, ConversionWorker)
@@ -38,12 +41,13 @@ class TestConversionWorker(unittest.TestCase):
             self.gui.job_exception.assert_called_once_with(
                 self.job, dialog_title='Translation job failed')
 
+    @patch(module_name + '.get_translator')
     @patch(module_name + '.os')
     @patch(module_name + '.open')
     @patch(module_name + '.get_metadata')
     @patch(module_name + '.set_metadata')
     def test_translate_done_ebook_to_library(
-            self, mock_set_metadata, mock_get_metadata, mock_open, mock_os):
+            self, mock_set_metadata, mock_get_metadata, mock_open, mock_os, mock_get_translator):
         self.job.failed = False
         self.job.description = 'test description'
         self.job.log_path = '/path/to/log'
@@ -70,6 +74,11 @@ class TestConversionWorker(unittest.TestCase):
         metadata.tags = []
         metadata.language = 'en'
         mock_get_metadata.return_value = metadata
+
+        # Mock translator for RTL/LTR handling
+        mock_translator = Mock()
+        mock_translator.get_source_code.return_value = 'en'
+        mock_get_translator.return_value = mock_translator
 
         self.worker.db.create_book_entry.return_value = 89
         self.worker.api.format_abspath.return_value = '/path/to/test[m].epub'
@@ -118,6 +127,7 @@ class TestConversionWorker(unittest.TestCase):
         self.assertIs(self.icon, arguments.get('icon'))
 
 
+    @patch(module_name + '.get_translator')
     @patch(module_name + '.open')
     @patch(module_name + '.open_path')
     @patch(module_name + '.os.rename')
@@ -125,7 +135,7 @@ class TestConversionWorker(unittest.TestCase):
     @patch(module_name + '.set_metadata')
     def test_translate_done_ebook_to_path(
             self, mock_set_metadata, mock_get_metadata, mock_os_rename,
-            mock_open_path, mock_open):
+            mock_open_path, mock_open, mock_get_translator):
         self.job.failed = False
         self.job.description = 'test description'
         self.job.log_path = str(Path('/path/to/log'))
@@ -152,6 +162,11 @@ class TestConversionWorker(unittest.TestCase):
         metadata.tags = []
         metadata.language = 'en'
         mock_get_metadata.return_value = metadata
+
+        # Mock translator for RTL/LTR handling
+        mock_translator = Mock()
+        mock_translator.get_source_code.return_value = 'en'
+        mock_get_translator.return_value = mock_translator
 
         self.worker.translate_done(self.job)
 
@@ -207,7 +222,7 @@ class TestConversionWorker(unittest.TestCase):
         self.ebook.custom_title = 'test custom title'
         self.ebook.target_lang = 'German'
         self.worker.working_jobs = {
-            self.job: (self.ebook, str(Path('/path/to/test.srt')))}
+            self.job: (self.ebook, str(Path('/path/to/test.srt')), False)}
         metadata = Mock()
         self.worker.api.get_metadata.return_value = metadata
         self.worker.api.format_abspath.return_value = \
@@ -270,7 +285,7 @@ class TestConversionWorker(unittest.TestCase):
         self.ebook.custom_title = 'test: custom title*'
         self.ebook.target_lang = 'German'
         self.worker.working_jobs = {
-            self.job: (self.ebook, str(Path('/path/to/test.srt')))}
+            self.job: (self.ebook, str(Path('/path/to/test.srt')), False)}
         metadata = Mock()
         self.worker.api.get_metadata.return_value = metadata
 

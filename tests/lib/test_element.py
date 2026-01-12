@@ -85,8 +85,8 @@ class TestFunction(unittest.TestCase):
 
         elements = get_metadata_elements(metadata)
 
-        # Changed to get ebook_metadata dict instead of individual key
-        mock_get_config().get.assert_called_with('ebook_metadata')
+        # Uses dot notation to get metadata_translation flag
+        mock_get_config().get.assert_called_with('ebook_metadata.metadata_translation', False)
         self.assertEqual(2, len(elements))
         self.assertIs(item_1, elements[0].element)
         self.assertTrue(elements[0].ignored)

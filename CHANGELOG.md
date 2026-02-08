@@ -1,3 +1,30 @@
+## v2.4.2
+
+Enhanced Anthropic/Claude integration with prompt caching, batch API, and translation quality improvements:
+
+**Claude Enhancements:**
+1. feat: Add UI controls for extended output (128K) and context (1M) beta features
+2. feat: Add token estimate helper for merge translation with language-specific ratios
+3. feat: Update default model to claude-sonnet-4-5
+4. feat: Implement dynamic max_tokens calculation based on input length and model capabilities
+5. feat: Add optional dynamic timeout scaling based on content length
+6. feat: Add prompt caching support for parallel translation with full book context
+7. feat: Implement batch translation for asynchronous bulk translation (50% cost reduction)
+
+**Translation Quality:**
+1. fix: Prevent partial translations with dynamic max_tokens scaling
+2. fix: Add pre-translation warning when merge length exceeds model max output
+3. fix: Proper cancellation during streaming (stop button now works immediately)
+4. fix: Improve streaming text insertion without scroll position disruption
+
+**General Improvements:**
+1. feat: Extract get_cache_id() utility for consistent cache ID calculation
+2. feat: Add log_content setting to control original/translated content verbosity in logs
+3. fix: Fix cache deletion with multiple selections (index shifting bug)
+4. refactor: Rename engine_class to current_engine for consistency
+
+---
+
 ## v2.4.1
 
 Added features and fixed bugs as follows:

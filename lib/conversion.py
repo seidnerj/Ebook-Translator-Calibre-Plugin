@@ -18,7 +18,7 @@ from calibre.ebooks.metadata.meta import (  # type: ignore
 from .. import EbookTranslator
 
 from .config import get_config
-from .utils import log, sep, uid, open_path, open_file
+from .utils import log, sep, open_path, open_file, get_cache_id
 from .cache import get_cache
 from .element import (
     get_element_handler, get_srt_elements, get_toc_elements, get_page_elements,
@@ -202,12 +202,9 @@ def convert_item(
     element_handler.set_translation_lang(
         translator.get_iso639_target_code(target_lang))
 
-    merge_length = str(element_handler.get_merge_length())
-    _encoding = ''
-    if encoding.lower() != 'utf-8':
-        _encoding = encoding.lower()
-    cache_id = uid(
-        input_path + translator.name + target_lang + merge_length + _encoding)
+    merge_length = element_handler.get_merge_length()
+    cache_id = get_cache_id(
+        input_path, translator.name, target_lang, merge_length, encoding)
     cache = get_cache(cache_id)
     cache.set_cache_only(cache_only)
     cache.set_info('title', ebook_title)
@@ -216,6 +213,8 @@ def convert_item(
     cache.set_info('merge_length', merge_length)
     cache.set_info('plugin_version', EbookTranslator.__version__)
     cache.set_info('calibre_version', __version__)
+    cache.set_info('source_lang', source_lang)
+    cache.set_info('target_direction', direction)
 
     translation = get_translation(
         translator, lambda text, error=False: log.info(text))
@@ -301,14 +300,13 @@ class ConversionWorker:
                 if ebook_metadata_config.get('lang_mark'):
                     ebook_title = '%s [%s]' % (ebook_title, ebook.target_lang)
                 metadata.title = ebook_title
-                if ebook_metadata_config.get('lang_code'):
+                if ebook_metadata_config.get('lang_code', True):
                     metadata.language = ebook.lang_code
                 subjects = ebook_metadata_config.get('subjects')
                 metadata.tags += (subjects or []) + [
                     'Translated by Ebook Translator: '
                     'https://translator.bookfere.com']
                 # metadata.authors = ['bookfere.com']
-                # metadata.author_sort = 'bookfere.com'
                 # metadata.book_producer = 'Ebook Translator'
                 set_metadata(file, metadata, ebook.output_format)
         else:

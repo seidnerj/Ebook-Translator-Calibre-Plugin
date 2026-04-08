@@ -606,6 +606,16 @@ class TranslationSetting(QDialog):
         prompt_caching_enabled.setVisible(False)
         genai_layout.addRow(prompt_caching_label, prompt_caching_enabled)
 
+        refusal_retries_label = QLabel(_('Refusal Retries'))
+        refusal_retries_value = QSpinBox()
+        refusal_retries_value.setRange(0, 50)
+        refusal_retries_value.setToolTip(_(
+            'Max retries when the model refuses to translate content it '
+            'identifies as copyrighted. Set to 0 to disable.'))
+        refusal_retries_label.setVisible(False)
+        refusal_retries_value.setVisible(False)
+        genai_layout.addRow(refusal_retries_label, refusal_retries_value)
+
         sampling_btn_group = QButtonGroup(sampling_widget)
         sampling_btn_group.addButton(temperature, 0)
         sampling_btn_group.addButton(top_p, 1)
@@ -650,8 +660,8 @@ class TranslationSetting(QDialog):
                 self.extended_output_enabled.setVisible(True)
                 extended_context_label.setVisible(False)
                 self.extended_context_enabled.setVisible(False)
-            # Show extended context for Claude Sonnet 4.0/4.5 models
-            elif model.startswith('claude-sonnet-4-0') or model.startswith('claude-sonnet-4-5'):
+            # Show extended context for Claude 4.6 models (1M native)
+            elif model.startswith('claude-sonnet-4-6') or model.startswith('claude-opus-4-6'):
                 extended_output_label.setVisible(False)
                 self.extended_output_enabled.setVisible(False)
                 extended_context_label.setVisible(True)
@@ -811,6 +821,8 @@ class TranslationSetting(QDialog):
             dynamic_timeout_enabled.setVisible(False)
             prompt_caching_label.setVisible(False)
             prompt_caching_enabled.setVisible(False)
+            refusal_retries_label.setVisible(False)
+            refusal_retries_value.setVisible(False)
 
             if issubclass(self.current_engine, ClaudeTranslate):
                 # Load configuration values
@@ -826,12 +838,17 @@ class TranslationSetting(QDialog):
                 prompt_caching_enabled.setChecked(
                     config.get('enable_prompt_caching',
                                self.current_engine.enable_prompt_caching))
+                refusal_retries_value.setValue(
+                    config.get('refusal_max_retries',
+                               self.current_engine.refusal_max_retries))
 
                 # Show options for all Claude models
                 dynamic_timeout_label.setVisible(True)
                 dynamic_timeout_enabled.setVisible(True)
                 prompt_caching_label.setVisible(True)
                 prompt_caching_enabled.setVisible(True)
+                refusal_retries_label.setVisible(True)
+                refusal_retries_value.setVisible(True)
 
                 # Connect to config updates
                 try:
@@ -849,6 +866,8 @@ class TranslationSetting(QDialog):
                     lambda checked: config.update(enable_dynamic_timeout=checked))
                 prompt_caching_enabled.toggled.connect(
                     lambda checked: config.update(enable_prompt_caching=checked))
+                refusal_retries_value.valueChanged.connect(
+                    lambda value: config.update(refusal_max_retries=value))
                 # Update token estimate when context setting changes
                 self.extended_context_enabled.toggled.connect(
                     lambda: self.update_merge_token_estimate())
@@ -1686,8 +1705,8 @@ class TranslationSetting(QDialog):
             context_window = 200_000
             model_matched = False
 
-        # Apply extended context if enabled for supported models
-        if model and (model.startswith('claude-sonnet-4-0') or model.startswith('claude-sonnet-4-5')) \
+        # Apply extended context if enabled for supported models (4.6)
+        if model and (model.startswith('claude-sonnet-4-6') or model.startswith('claude-opus-4-6')) \
                 and self.extended_context_enabled.isChecked():
             context_window = 1_000_000
 

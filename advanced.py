@@ -722,16 +722,21 @@ class AdvancedTranslation(QDialog):
         batch_translation = QPushButton(
             ' %s (%s)' % (_('Batch Translation'), _('Beta')))
         translate_all = QPushButton('  %s  ' % _('Translate All'))
+        translate_untranslated = QPushButton(
+            '  %s  ' % _('Translate Untranslated'))
         translate_selected = QPushButton('  %s  ' % _('Translate Selected'))
 
         delete_button.clicked.connect(self.table.delete_selected_rows)
         translate_all.clicked.connect(self.translate_all_paragraphs)
+        translate_untranslated.clicked.connect(
+            self.translate_untranslated_paragraphs)
         translate_selected.clicked.connect(self.translate_selected_paragraph)
 
         action_layout.addWidget(delete_button)
         action_layout.addStretch(1)
         action_layout.addWidget(batch_translation)
         action_layout.addWidget(translate_all)
+        action_layout.addWidget(translate_untranslated)
         action_layout.addWidget(translate_selected)
 
         stop_widget = QWidget()
@@ -1313,6 +1318,19 @@ class AdvancedTranslation(QDialog):
                 return
         self.translate_all = True
         self.trans_worker.translate.emit(paragraphs, is_fresh)
+
+    def translate_untranslated_paragraphs(self):
+        """Translate only paragraphs that don't have a translation yet."""
+        paragraphs = self.table.get_selected_paragraphs(True, True)
+        if len(paragraphs) < 1:
+            self.alert.pop(
+                _('All paragraphs have already been translated.'), 'info')
+            return
+        self.progress_step = self.get_progress_step(len(paragraphs))
+        if not self.check_max_tokens_capacity():
+            return
+        self.translate_all = True
+        self.trans_worker.translate.emit(paragraphs, False)
 
     def translate_selected_paragraph(self):
         paragraphs = self.table.get_selected_paragraphs()

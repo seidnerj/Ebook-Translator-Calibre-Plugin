@@ -203,20 +203,26 @@ class Translation:
                 logged = translation[:200]
                 if len(translation) > 200:
                     logged += '...'
+                row_info = _('Row: {}').format(paragraph.row) \
+                    if paragraph.row >= 0 else ''
                 if refusal_attempt < refusal_retries:
-                    self.log('\n'.join([
+                    self.log('\n'.join(filter(None, [
                         sep(),
+                        row_info,
                         _('Translation refusal detected, retrying ({}/{})').format(
                             refusal_attempt + 1, refusal_retries),
                         sep('┈'),
                         _('Response: {}').format(logged),
-                    ]), True)
+                    ])), True)
                     time.sleep(2)
                     continue
                 # All retries exhausted — fail instead of saving refusal text
                 raise TranslationFailed(
                     _('Translation refused after {} retries. '
-                      'Response: {}').format(refusal_retries, logged))
+                      '{} Response: {}').format(
+                        refusal_retries,
+                        row_info + '.' if row_info else '',
+                        logged))
             break
 
         paragraph.translation = translation.strip()

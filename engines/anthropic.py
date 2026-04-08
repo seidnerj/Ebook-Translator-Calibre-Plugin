@@ -50,10 +50,10 @@ class ClaudeTranslate(GenAI):
     top_k = 1
     stream = True
     enable_extended_output = False  # 128K output for Claude 3.7 Sonnet
-    enable_extended_context = False  # 1M context for Claude Sonnet 4.0/4.5
+    enable_extended_context = True  # 1M context (native on Claude 4.6 models)
     enable_dynamic_timeout = False  # Dynamic timeout based on content length
     enable_prompt_caching = False  # Prompt caching for parallel sections with full context
-    refusal_max_retries = 5  # Max retries when Claude refuses to translate (copyright concerns)
+    refusal_max_retries = 10  # Max retries when Claude refuses to translate (copyright concerns)
 
     # event types for streaming are listed here:
     # https://docs.anthropic.com/en/api/messages-streaming
@@ -68,7 +68,7 @@ class ClaudeTranslate(GenAI):
         'message_stop']
 
     models: list[str] = []
-    model: str | None = 'claude-sonnet-4-5'
+    model: str | None = 'claude-sonnet-4-6'
 
     def __init__(self):
         super().__init__()
@@ -88,6 +88,8 @@ class ClaudeTranslate(GenAI):
             'enable_dynamic_timeout', self.enable_dynamic_timeout)
         self.enable_prompt_caching = self.config.get(
             'enable_prompt_caching', self.enable_prompt_caching)
+        self.refusal_max_retries = self.config.get(
+            'refusal_max_retries', self.refusal_max_retries)
         self.full_book_context = None  # Set externally for prompt caching
 
     # Patterns that indicate Claude refused to translate due to copyright concerns.
@@ -254,25 +256,11 @@ class ClaudeTranslate(GenAI):
             # (requires user to enable this option)
             if self.enable_extended_output and self.model.startswith('claude-3-7-sonnet-'):
                 beta_features.append('output-128k-2025-02-19')
-            # For Claude Sonnet 4/4.5 - enable 1M token context window
-            # (requires user to enable this option)
-            # More info: https://platform.claude.com/docs/en/about-claude/pricing#long-context-pricing
-            #
-            # NOTE: When the 1M token context window is enabled, requests that exceed 200K input tokens
-            #       are automatically charged at premium long context rates. The 1M token context window
-            #       is currently in beta for organizations in usage tier 4 and organizations with custom
-            #       rate limits.
-            #
-            #       Even with the beta flag enabled, requests with fewer than 200K input tokens are
-            #       charged at standard rates. If your request exceeds 200K input tokens, all tokens
-            #       incur premium pricing.
-            #
-            #       The 200K threshold is based solely on input tokens (including cache reads/writes).
-            #       Output token count does not affect pricing tier selection, though output tokens are
-            #       charged at the higher rate when the input threshold is exceeded.
+            # For Claude 4.6 models - 1M context is native, no extra cost.
+            # The beta header is kept as a no-op safeguard.
             elif self.enable_extended_context and (
-                    self.model.startswith('claude-sonnet-4-0') or
-                    self.model.startswith('claude-sonnet-4-5')):
+                    self.model.startswith('claude-sonnet-4-6') or
+                    self.model.startswith('claude-opus-4-6')):
                 beta_features.append('context-1m-2025-08-07')
 
         # Prompt caching can be used with any Claude model

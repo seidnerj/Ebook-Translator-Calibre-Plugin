@@ -188,7 +188,6 @@ class CacheTableView(QTableView):
             _('Are you sure you want to delete the selected cache(s)?'))
         if action != 'yes':
             return
-
         # Collect all selected rows with their data first
         selected_items = [(row.row(), row.data(Qt.UserRole)) for row in self.selectionModel().selectedRows()]
         # Sort by row number descending to delete from bottom to top
@@ -198,7 +197,6 @@ class CacheTableView(QTableView):
         for row_num, filename in selected_items:
             TranslationCache.remove(filename)
             self.model().delete(row_num)
-
         self.clearSelection()
         if self.parent is not None:
             self.parent.cache_count.emit()

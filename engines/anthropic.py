@@ -1,7 +1,15 @@
 import json
 import time
+import ssl
 from typing import Generator
 from urllib.parse import urljoin
+from urllib.request import (
+    Request as _UrlRequest,
+    urlopen as _urlopen,
+    build_opener as _build_opener,
+    ProxyHandler as _ProxyHandler,
+    HTTPSHandler as _HTTPSHandler,
+)
 from http.client import IncompleteRead
 
 from mechanize._response import response_seek_wrapper as Response
@@ -357,20 +365,47 @@ class ClaudeTranslate(GenAI):
             'messages': [{'role': 'user', 'content': input_text}],
         })
 
-        response = request(
+        # Use urllib directly rather than the project's mechanize-backed
+        # request() helper. mechanize's response_seek_wrapper can buffer
+        # streaming responses in ways that defeat incremental readline().
+        # urllib's HTTPResponse exposes a true streaming socket file
+        # object, so readline() returns as soon as a complete line is
+        # available on the wire.
+        url_req = _UrlRequest(
             self.endpoint,
-            data=body,
+            data=body.encode('utf-8'),
             headers={
                 'Content-Type': 'application/json',
                 'anthropic-version': self.api_version,
                 'x-api-key': self.api_key,
             },
             method='POST',
-            timeout=max(int(self.request_timeout) * 4, 120),
-            proxy_uri=(
-                self.proxy_uri if self.proxy_type == 'http' else None),
-            raw_object=True,
         )
+        try:
+            ssl_ctx = ssl.create_default_context()
+        except Exception:
+            ssl_ctx = ssl._create_unverified_context()
+        # Build opener with proxy + SSL context if needed.
+        handlers = [_HTTPSHandler(context=ssl_ctx)]
+        if self.proxy_type == 'http' and self.proxy_uri:
+            handlers.append(_ProxyHandler({
+                'http': self.proxy_uri,
+                'https': self.proxy_uri,
+            }))
+            opener = _build_opener(*handlers)
+            response = opener.open(
+                url_req,
+                timeout=max(int(self.request_timeout) * 4, 120),
+            )
+        else:
+            response = _urlopen(
+                url_req,
+                timeout=max(int(self.request_timeout) * 4, 120),
+                context=ssl_ctx,
+            )
+        if on_progress:
+            on_progress(_('  HTTP connection established, '
+                          'awaiting first event...'))
 
         # Collect streamed text. Decouples blocking I/O from the main
         # loop using a reader thread + queue, so we can check
@@ -399,15 +434,19 @@ class ClaudeTranslate(GenAI):
         ERR = object()
 
         def _reader():
-            try:
-                while not reader_done.is_set():
+            while not reader_done.is_set():
+                try:
                     raw = response.readline()
                     if not raw:
                         read_queue.put((EOF, None))
                         return
                     read_queue.put(('line', raw))
-            except Exception as e:
-                read_queue.put((ERR, e))
+                except IncompleteRead:
+                    # Transient — keep reading. Mirrors _parse_stream.
+                    continue
+                except Exception as e:
+                    read_queue.put((ERR, e))
+                    return
 
         reader_thread = threading.Thread(target=_reader, daemon=True)
         reader_thread.start()

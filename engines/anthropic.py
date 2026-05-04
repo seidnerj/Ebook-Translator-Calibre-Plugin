@@ -280,14 +280,20 @@ class ClaudeTranslate(GenAI):
         """Pass-2 consistency review. Takes a list of {index, translation}
         dicts representing the translated paragraphs (in order) and asks
         the model to identify inconsistencies in character names, gender
-        forms, and recurring terminology. Returns a list of corrections in
-        the form {index, translation, reason}.
+        forms, and recurring terminology.
+
+        Returns a dict with two keys:
+          - 'glossary': list of {term, canonical, type, notes} entries
+            describing the canonical translations the model used as the
+            consistency reference. Logged for transparency.
+          - 'corrections': list of {index, translation, reason} entries
+            for paragraphs that need correction.
 
         Sees only translated text — no copyright risk, since this is the
         user's own translation output, not the original copyrighted book.
         """
         if not items:
-            return []
+            return {'glossary': [], 'corrections': []}
 
         # Build the indexed input (one numbered block per paragraph)
         input_text = '\n\n'.join(
@@ -297,21 +303,30 @@ class ClaudeTranslate(GenAI):
         target_lang = self.target_lang
         system_prompt = (
             'You are reviewing a {tlang} translation of a book for '
-            'consistency. Identify paragraphs that contain inconsistencies '
-            'with the rest of the translation in:\n'
-            '1. Character name transliterations (the same person rendered '
-            'differently in different paragraphs)\n'
-            '2. Gender forms (masculine/feminine grammar for the same '
-            'character used inconsistently)\n'
-            '3. Recurring terminology (titles, places, specialized '
-            'vocabulary translated differently across paragraphs)\n\n'
-            'For each inconsistency, output a JSON object with the '
-            'paragraph index, a brief reason, and the full corrected '
-            'translation of that paragraph. Do not output paragraphs that '
-            'have no issues.\n\n'
-            'Output ONLY a JSON array, no other text or markdown:\n'
-            '[{{"index": <number>, "reason": "<brief explanation>", '
-            '"translation": "<full corrected paragraph text>"}}, ...]'
+            'consistency. First, identify the canonical (most common) '
+            'translation of each recurring proper noun, character name, '
+            'title, and key term. Then identify paragraphs that use a '
+            'different translation than the canonical one for any such '
+            'item, or that use inconsistent gender forms for the same '
+            'character.\n\n'
+            'Output ONLY a JSON object, no other text or markdown:\n'
+            '{{\n'
+            '  "glossary": [\n'
+            '    {{"term": "<term as it commonly appears>", '
+            '"canonical": "<canonical translation>", '
+            '"type": "<character|place|title|term>", '
+            '"notes": "<e.g. feminine, plural, etc., or empty>"}}\n'
+            '  ],\n'
+            '  "corrections": [\n'
+            '    {{"index": <number>, "reason": "<brief explanation>", '
+            '"translation": "<full corrected paragraph text>"}}\n'
+            '  ]\n'
+            '}}\n\n'
+            'Only include glossary entries for items that recur multiple '
+            'times. Only include corrections for paragraphs that actually '
+            'need fixing — do not include paragraphs that match the '
+            'canonical glossary. If there are no inconsistencies, return '
+            'the glossary with an empty corrections array.'
         ).format(tlang=target_lang)
 
         body = json.dumps({
@@ -338,36 +353,61 @@ class ClaudeTranslate(GenAI):
         result = json.loads(response)
         raw_text = result['content'][0]['text'].strip()
 
-        # Try direct JSON parse; fall back to extracting an array from
+        # Try direct JSON parse; fall back to extracting an object from
         # surrounding text (some models add commentary despite instructions).
+        parsed = None
         try:
-            corrections_raw = json.loads(raw_text)
+            parsed = json.loads(raw_text)
         except json.JSONDecodeError:
             import re as _re
-            match = _re.search(r'\[.*\]', raw_text, _re.DOTALL)
-            if not match:
-                return []
-            corrections_raw = json.loads(match.group())
+            match = _re.search(r'\{.*\}', raw_text, _re.DOTALL)
+            if match:
+                try:
+                    parsed = json.loads(match.group())
+                except json.JSONDecodeError:
+                    parsed = None
+        if not isinstance(parsed, dict):
+            return {'glossary': [], 'corrections': []}
 
-        if not isinstance(corrections_raw, list):
-            return []
+        # Validate glossary
+        glossary_raw = parsed.get('glossary') or []
+        glossary = []
+        if isinstance(glossary_raw, list):
+            for g in glossary_raw:
+                if not isinstance(g, dict):
+                    continue
+                canonical = (g.get('canonical') or '').strip()
+                term = (g.get('term') or '').strip()
+                if not canonical:
+                    continue
+                glossary.append({
+                    'term': term,
+                    'canonical': canonical,
+                    'type': (g.get('type') or '').strip(),
+                    'notes': (g.get('notes') or '').strip(),
+                })
+
+        # Validate corrections
         valid_indices = {item['index'] for item in items}
+        corrections_raw = parsed.get('corrections') or []
         corrections = []
-        for c in corrections_raw:
-            if not isinstance(c, dict):
-                continue
-            idx = c.get('index')
-            if idx not in valid_indices:
-                continue
-            new_text = c.get('translation', '').strip()
-            if not new_text:
-                continue
-            corrections.append({
-                'index': idx,
-                'translation': new_text,
-                'reason': c.get('reason', ''),
-            })
-        return corrections
+        if isinstance(corrections_raw, list):
+            for c in corrections_raw:
+                if not isinstance(c, dict):
+                    continue
+                idx = c.get('index')
+                if idx not in valid_indices:
+                    continue
+                new_text = (c.get('translation') or '').strip()
+                if not new_text:
+                    continue
+                corrections.append({
+                    'index': idx,
+                    'translation': new_text,
+                    'reason': (c.get('reason') or '').strip(),
+                })
+
+        return {'glossary': glossary, 'corrections': corrections}
 
     def get_models(self):
         model_endpoint = urljoin(self.endpoint, 'models')

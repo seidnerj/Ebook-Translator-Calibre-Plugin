@@ -495,10 +495,39 @@ class Translation:
                  .format(len(items)))
 
         try:
-            corrections = self.translator.consistency_review(items)
+            review = self.translator.consistency_review(items)
         except Exception as e:
             self.log(_('Consistency pass failed: {}').format(str(e)), True)
             return
+
+        # Backwards compatibility: older return shape was a flat list of
+        # corrections. New shape is {'glossary': [...], 'corrections': [...]}.
+        if isinstance(review, list):
+            glossary = []
+            corrections = review
+        elif isinstance(review, dict):
+            glossary = review.get('glossary') or []
+            corrections = review.get('corrections') or []
+        else:
+            glossary = []
+            corrections = []
+
+        # Log the extracted glossary for transparency. This shows the user
+        # what canonical translations the model used as the consistency
+        # reference — useful for review and for future manual edits.
+        if glossary:
+            self.log(sep('┈'))
+            self.log(_('Glossary ({} entries):').format(len(glossary)))
+            for g in glossary:
+                term = g.get('term', '')
+                canonical = g.get('canonical', '')
+                gtype = g.get('type', '')
+                notes = g.get('notes', '')
+                # Format: "Alex → אלכסה (character, feminine)"
+                meta_parts = [p for p in (gtype, notes) if p]
+                meta = ' ({})'.format(', '.join(meta_parts)) if meta_parts \
+                    else ''
+                self.log('  {} → {}{}'.format(term, canonical, meta))
 
         if not corrections:
             self.log(_('Consistency pass: no inconsistencies found.'))

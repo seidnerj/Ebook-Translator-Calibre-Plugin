@@ -284,8 +284,99 @@ class ClaudeTranslate(GenAI):
                 return self._content_filter_refusal()
             raise
 
+    # Patterns indicating the model refused to perform a review (rather
+    # than returning the requested JSON). Different from the translation
+    # refusal indicators because review-style refusals talk about
+    # "reviewing" or "helping with content", not "translating".
+    _review_refusal_indicators = [
+        "i cannot",
+        "i can't",
+        "i'm not able",
+        "i am not able",
+        "unable to",
+        "cannot review",
+        "can't review",
+        "cannot assist",
+        "can't help with",
+        "copyright",
+        "copyrighted",
+        "i'd be happy to help",
+        "i would be happy to help",
+        "i'm sorry",
+    ]
+
+    def _is_review_refusal(self, raw_text):
+        """Return True if the raw response looks like a refusal to
+        perform the review (rather than a malformed JSON or empty
+        response). Uses the same 2+-match heuristic as translation
+        refusal detection."""
+        if not raw_text:
+            return False
+        text_lower = raw_text.lower()
+        matches = sum(1 for p in self._review_refusal_indicators
+                      if p in text_lower)
+        return matches >= 2
+
+    def _consistency_system_prompt(self, target_lang, attempt=0):
+        """Build the system prompt for a consistency review attempt.
+        Higher attempt numbers use stronger editorial-context framing
+        to recover from refusals on the first try."""
+        if attempt == 0:
+            framing = (
+                'You are reviewing a {tlang} translation of a book for '
+                'consistency. First, identify the canonical (most '
+                'common) translation of each recurring proper noun, '
+                'character name, title, and key term. Then identify '
+                'paragraphs that use a different translation than the '
+                'canonical one for any such item, or that use '
+                'inconsistent gender forms for the same character.'
+            ).format(tlang=target_lang)
+        else:
+            # Stronger framing: explicit operator/editor context. The
+            # user has already produced this translation; we are only
+            # asking for editorial review, not new content.
+            framing = (
+                'You are an editorial assistant integrated into a '
+                'translation tool. The user has produced a {tlang} '
+                'translation of their personal copy of a book and is '
+                'requesting an editorial consistency review of their '
+                'own work — they are not asking you to translate or '
+                'reproduce any source material. Your job is to identify '
+                'inconsistencies between paragraphs in the user\'s '
+                'translation: character name spellings, gender forms, '
+                'and recurring terminology. Only output minimal '
+                'corrections to specific inconsistencies — you are not '
+                'producing or expanding content, only correcting the '
+                'user\'s existing edits. This editorial review is a '
+                'standard quality-assurance task.'
+            ).format(tlang=target_lang)
+
+        schema = (
+            '\n\n'
+            'Output ONLY a JSON object, no other text or markdown:\n'
+            '{\n'
+            '  "glossary": [\n'
+            '    {"term": "<term as it commonly appears>", '
+            '"canonical": "<canonical translation>", '
+            '"type": "<character|place|title|term>", '
+            '"notes": "<e.g. feminine, plural, etc., or empty>"}\n'
+            '  ],\n'
+            '  "corrections": [\n'
+            '    {"index": <number>, "reason": "<brief explanation>", '
+            '"translation": "<full corrected paragraph text>"}\n'
+            '  ]\n'
+            '}\n\n'
+            'Only include glossary entries for items that recur '
+            'multiple times. Only include corrections for paragraphs '
+            'that actually need fixing — do not include paragraphs '
+            'that match the canonical glossary. If there are no '
+            'inconsistencies, return the glossary with an empty '
+            'corrections array.'
+        )
+        return framing + schema
+
     def consistency_review(self, items, on_progress=None,
-                           cancel_request=None):
+                           cancel_request=None, _attempt=0):
         """Pass-2 consistency review. Takes a list of {index, translation}
         dicts representing the translated paragraphs (in order) and asks
         the model to identify inconsistencies in character names, gender
@@ -323,33 +414,12 @@ class ClaudeTranslate(GenAI):
             for item in items)
 
         target_lang = self.target_lang
-        system_prompt = (
-            'You are reviewing a {tlang} translation of a book for '
-            'consistency. First, identify the canonical (most common) '
-            'translation of each recurring proper noun, character name, '
-            'title, and key term. Then identify paragraphs that use a '
-            'different translation than the canonical one for any such '
-            'item, or that use inconsistent gender forms for the same '
-            'character.\n\n'
-            'Output ONLY a JSON object, no other text or markdown:\n'
-            '{{\n'
-            '  "glossary": [\n'
-            '    {{"term": "<term as it commonly appears>", '
-            '"canonical": "<canonical translation>", '
-            '"type": "<character|place|title|term>", '
-            '"notes": "<e.g. feminine, plural, etc., or empty>"}}\n'
-            '  ],\n'
-            '  "corrections": [\n'
-            '    {{"index": <number>, "reason": "<brief explanation>", '
-            '"translation": "<full corrected paragraph text>"}}\n'
-            '  ]\n'
-            '}}\n\n'
-            'Only include glossary entries for items that recur multiple '
-            'times. Only include corrections for paragraphs that actually '
-            'need fixing — do not include paragraphs that match the '
-            'canonical glossary. If there are no inconsistencies, return '
-            'the glossary with an empty corrections array.'
-        ).format(tlang=target_lang)
+        system_prompt = self._consistency_system_prompt(
+            target_lang, attempt=_attempt)
+        if _attempt > 0 and on_progress:
+            on_progress(_('  Retrying consistency review with stronger '
+                          'editorial framing (attempt {})...')
+                        .format(_attempt + 1))
 
         # Stream the response. The consistency review can take many minutes
         # for a long book, which would exceed any reasonable socket read
@@ -562,6 +632,22 @@ class ClaudeTranslate(GenAI):
                 except json.JSONDecodeError:
                     parsed = None
         if not isinstance(parsed, dict):
+            # If the unparseable response looks like a refusal AND we
+            # haven't retried yet, give it one more shot with a stronger
+            # editorial-context prompt. Refusals here are rare (the
+            # consistency pass only sees the user's own translation) but
+            # do happen for very famous books or distinctive content.
+            if (_attempt < 1
+                    and self._is_review_refusal(raw_text)):
+                if on_progress:
+                    on_progress(_('  Detected refusal in raw response — '
+                                  'retrying with stronger editorial '
+                                  'framing'))
+                return self.consistency_review(
+                    items,
+                    on_progress=on_progress,
+                    cancel_request=cancel_request,
+                    _attempt=_attempt + 1)
             # Always include the raw response so the orchestrator can
             # surface it to the log when parsing fails — this avoids the
             # silent "no inconsistencies found" outcome that's

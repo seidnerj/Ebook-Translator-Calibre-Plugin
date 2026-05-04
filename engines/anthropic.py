@@ -373,18 +373,23 @@ class ClaudeTranslate(GenAI):
         )
 
         # Collect streamed text. Mirrors _parse_stream but accumulates
-        # the entire output instead of yielding chunks.
+        # the entire output instead of yielding chunks. We surface
+        # lifecycle events so the user can distinguish the "model is
+        # processing input" phase (no text yet, just pings) from active
+        # output generation.
         if on_progress:
             on_progress(_('Streaming response from model — '
-                          'this can take several minutes for long books...'))
+                          'large prompts may take 30-60s before output '
+                          'starts...'))
         chunks = []
         chars_received = 0
-        # Heartbeat: log a progress line every 500 chars so the user can
-        # see the response materializing. Chosen to balance signal vs.
-        # noise — typical full responses are 5K-50K chars, giving 10-100
-        # progress lines.
+        # Heartbeat: log a progress line every 500 chars after output
+        # begins. Chosen to balance signal vs. noise — typical full
+        # responses are 5K-50K chars, giving 10-100 progress lines.
         progress_step = 500
         next_progress_at = progress_step
+        ping_count = 0
+        output_started = False
         while True:
             # Honor cancellation between reads. Each readline() blocks
             # until the next SSE chunk arrives (~50-100ms), so the user
@@ -411,7 +416,17 @@ class ClaudeTranslate(GenAI):
             etype = evt.get('type')
             if etype == 'message_stop':
                 break
-            if etype == 'content_block_delta':
+            if etype == 'message_start':
+                # Confirms Anthropic accepted the request and is now
+                # processing the prompt.
+                if on_progress:
+                    on_progress(_('  Model accepted request, '
+                                  'processing input...'))
+            elif etype == 'content_block_start':
+                if on_progress:
+                    on_progress(_('  Output started, streaming...'))
+                output_started = True
+            elif etype == 'content_block_delta':
                 delta = evt.get('delta') or {}
                 text = delta.get('text')
                 if text:
@@ -422,6 +437,15 @@ class ClaudeTranslate(GenAI):
                         on_progress(_('  ...{} characters received')
                                     .format(chars_received))
                         next_progress_at = chars_received + progress_step
+            elif etype == 'ping':
+                # Anthropic sends ping events as keepalive while
+                # processing input. Log one heartbeat every 10 pings so
+                # the user can see the connection is alive even before
+                # output starts.
+                ping_count += 1
+                if not output_started and on_progress and ping_count % 10 == 0:
+                    on_progress(_('  ...still processing input '
+                                  '({} keepalive pings)').format(ping_count))
             elif etype == 'error':
                 raise Exception(_('Consistency review error: {}').format(
                     evt.get('error', {}).get('message', 'unknown')))

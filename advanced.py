@@ -783,10 +783,11 @@ class AdvancedTranslation(QDialog):
         delete_button.setDisabled(True)
         translate_selected.setDisabled(True)
 
-        # Consistency pass: visible only for Claude with the feature
-        # enabled; enabled only when ALL paragraphs have translations
-        # (the pass needs the full picture to extract a coherent
-        # glossary and find inconsistencies).
+        # Consistency pass: the button is a manual trigger and is shown
+        # for Claude regardless of the "auto-run after translation"
+        # setting. The setting only controls whether the pass runs
+        # automatically at the end of translate_paragraphs; users can
+        # always invoke it manually via this button.
         consistency_pass_button.setVisible(False)
 
         def _last_consistency_pass_label():
@@ -805,9 +806,6 @@ class AdvancedTranslation(QDialog):
             visible = (
                 engine_class is not None
                 and issubclass(engine_class, ClaudeTranslate)
-                and getattr(engine_class, 'config', {}).get(
-                    'enable_consistency_pass',
-                    getattr(engine_class, 'enable_consistency_pass', False))
             )
             consistency_pass_button.setVisible(visible)
             if not visible:

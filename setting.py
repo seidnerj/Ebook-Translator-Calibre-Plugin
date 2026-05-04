@@ -636,14 +636,17 @@ class TranslationSetting(QDialog):
 
         consistency_pass_label = QLabel(_('Consistency Pass'))
         consistency_pass_enabled = QCheckBox(_(
-            'Review translation for consistency after completion '
+            'Automatically run a consistency pass after translation '
             '(extra API call)'))
         consistency_pass_enabled.setToolTip(_(
-            'After the main translation completes, run a second pass over '
-            'all translated paragraphs to identify and correct '
-            'inconsistencies in character names, gender forms, and '
-            'recurring terminology. Only the translated text is sent — '
-            'the original copyrighted source is never re-included.'))
+            'When checked, automatically run a Pass-2 consistency review '
+            'after the main translation completes — identifying and '
+            'correcting inconsistencies in character names, gender forms, '
+            'and recurring terminology. Only the translated text is sent '
+            '— the original copyrighted source is never re-included.\n\n'
+            'Independent of this setting, you can also run the '
+            'consistency pass manually from the advanced translation '
+            'window once all paragraphs are translated.'))
         consistency_pass_label.setVisible(False)
         consistency_pass_enabled.setVisible(False)
         genai_layout.addRow(consistency_pass_label, consistency_pass_enabled)

@@ -624,6 +624,20 @@ class TranslationSetting(QDialog):
         refusal_retries_value.setVisible(False)
         genai_layout.addRow(refusal_retries_label, refusal_retries_value)
 
+        consistency_pass_label = QLabel(_('Consistency Pass'))
+        consistency_pass_enabled = QCheckBox(_(
+            'Review translation for consistency after completion '
+            '(extra API call)'))
+        consistency_pass_enabled.setToolTip(_(
+            'After the main translation completes, run a second pass over '
+            'all translated paragraphs to identify and correct '
+            'inconsistencies in character names, gender forms, and '
+            'recurring terminology. Only the translated text is sent — '
+            'the original copyrighted source is never re-included.'))
+        consistency_pass_label.setVisible(False)
+        consistency_pass_enabled.setVisible(False)
+        genai_layout.addRow(consistency_pass_label, consistency_pass_enabled)
+
         sampling_btn_group = QButtonGroup(sampling_widget)
         sampling_btn_group.addButton(temperature, 0)
         sampling_btn_group.addButton(top_p, 1)
@@ -831,6 +845,8 @@ class TranslationSetting(QDialog):
             prompt_caching_enabled.setVisible(False)
             refusal_retries_label.setVisible(False)
             refusal_retries_value.setVisible(False)
+            consistency_pass_label.setVisible(False)
+            consistency_pass_enabled.setVisible(False)
 
             if issubclass(self.current_engine, ClaudeTranslate):
                 # Load configuration values
@@ -849,6 +865,9 @@ class TranslationSetting(QDialog):
                 refusal_retries_value.setValue(
                     config.get('refusal_max_retries',
                                self.current_engine.refusal_max_retries))
+                consistency_pass_enabled.setChecked(
+                    config.get('enable_consistency_pass',
+                               self.current_engine.enable_consistency_pass))
 
                 # Show options for all Claude models
                 dynamic_timeout_label.setVisible(True)
@@ -857,6 +876,8 @@ class TranslationSetting(QDialog):
                 prompt_caching_enabled.setVisible(True)
                 refusal_retries_label.setVisible(True)
                 refusal_retries_value.setVisible(True)
+                consistency_pass_label.setVisible(True)
+                consistency_pass_enabled.setVisible(True)
 
                 # Connect to config updates
                 try:
@@ -876,6 +897,9 @@ class TranslationSetting(QDialog):
                     lambda checked: config.update(enable_prompt_caching=checked))
                 refusal_retries_value.valueChanged.connect(
                     lambda value: config.update(refusal_max_retries=value))
+                consistency_pass_enabled.toggled.connect(
+                    lambda checked: config.update(
+                        enable_consistency_pass=checked))
                 # Update token estimate when context setting changes
                 self.extended_context_enabled.toggled.connect(
                     lambda: self.update_merge_token_estimate())

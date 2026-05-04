@@ -498,9 +498,15 @@ class Translation:
             # Forward progress messages from the engine to the log so the
             # user can see the streaming response materializing — without
             # this, the UI looks frozen for several minutes while the
-            # model generates the review.
+            # model generates the review. Forward cancel_request so Stop
+            # interrupts the streaming readline loop responsively.
             review = self.translator.consistency_review(
-                items, on_progress=self.log)
+                items,
+                on_progress=self.log,
+                cancel_request=self.cancel_request)
+        except TranslationCanceled:
+            self.log(_('Consistency pass canceled.'))
+            return
         except Exception as e:
             self.log(_('Consistency pass failed: {}').format(str(e)), True)
             return

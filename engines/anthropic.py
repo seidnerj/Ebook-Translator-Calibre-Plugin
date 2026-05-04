@@ -329,10 +329,16 @@ class ClaudeTranslate(GenAI):
             'the glossary with an empty corrections array.'
         ).format(tlang=target_lang)
 
+        # Stream the response. The consistency review can take many minutes
+        # for a long book, which would exceed any reasonable socket read
+        # timeout if we waited for the full response. Streaming lets each
+        # individual read complete quickly while the overall generation
+        # continues in the background.
         body = json.dumps({
             'model': self.model,
             'max_tokens': 64_000,
             'temperature': 0,
+            'stream': True,
             'system': system_prompt,
             'messages': [{'role': 'user', 'content': input_text}],
         })
@@ -349,9 +355,37 @@ class ClaudeTranslate(GenAI):
             timeout=max(int(self.request_timeout) * 4, 120),
             proxy_uri=(
                 self.proxy_uri if self.proxy_type == 'http' else None),
+            raw_object=True,
         )
-        result = json.loads(response)
-        raw_text = result['content'][0]['text'].strip()
+
+        # Collect streamed text. Mirrors _parse_stream but accumulates
+        # the entire output instead of yielding chunks.
+        chunks = []
+        while True:
+            try:
+                line = response.readline().decode('utf-8').strip()
+            except IncompleteRead:
+                continue
+            except Exception:
+                break
+            if not line.startswith('data:'):
+                continue
+            try:
+                evt = json.loads(line.split('data: ', 1)[1])
+            except (IndexError, json.JSONDecodeError):
+                continue
+            etype = evt.get('type')
+            if etype == 'message_stop':
+                break
+            if etype == 'content_block_delta':
+                delta = evt.get('delta') or {}
+                text = delta.get('text')
+                if text:
+                    chunks.append(str(text))
+            elif etype == 'error':
+                raise Exception(_('Consistency review error: {}').format(
+                    evt.get('error', {}).get('message', 'unknown')))
+        raw_text = ''.join(chunks).strip()
 
         # Try direct JSON parse; fall back to extracting an object from
         # surrounding text (some models add commentary despite instructions).

@@ -495,7 +495,12 @@ class Translation:
                  .format(len(items)))
 
         try:
-            review = self.translator.consistency_review(items)
+            # Forward progress messages from the engine to the log so the
+            # user can see the streaming response materializing — without
+            # this, the UI looks frozen for several minutes while the
+            # model generates the review.
+            review = self.translator.consistency_review(
+                items, on_progress=self.log)
         except Exception as e:
             self.log(_('Consistency pass failed: {}').format(str(e)), True)
             return

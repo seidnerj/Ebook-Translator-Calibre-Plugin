@@ -59,6 +59,7 @@ class ClaudeTranslate(GenAI):
     enable_dynamic_timeout = False  # Dynamic timeout based on content length
     enable_prompt_caching = False  # Prompt caching for parallel sections with full context
     refusal_max_retries = 3  # Max retries when Claude refuses to translate (after splitting kicks in)
+    enable_consistency_pass = False  # Run a Pass-2 consistency review after main translation
 
     # event types for streaming are listed here:
     # https://docs.anthropic.com/en/api/messages-streaming
@@ -95,6 +96,8 @@ class ClaudeTranslate(GenAI):
             'enable_prompt_caching', self.enable_prompt_caching)
         self.refusal_max_retries = self.config.get(
             'refusal_max_retries', self.refusal_max_retries)
+        self.enable_consistency_pass = self.config.get(
+            'enable_consistency_pass', self.enable_consistency_pass)
         self.full_book_context = None  # Set externally for prompt caching
 
     # Patterns that indicate Claude refused to translate due to copyright concerns.
@@ -212,6 +215,32 @@ class ClaudeTranslate(GenAI):
                        '{{id_\\d+}} in the content are retained.')
         return prompt
 
+    # Substrings that identify Anthropic's content filter HTTP 400.
+    # These are returned as the error message body when the content
+    # filter blocks input or output for copyright/policy reasons.
+    _content_filter_markers = [
+        'output blocked by content filtering',
+        'input blocked by content filtering',
+        'content filtering policy',
+    ]
+
+    def _is_content_filter_error(self, exc):
+        msg = str(exc).lower()
+        return any(m in msg for m in self._content_filter_markers)
+
+    def _content_filter_refusal(self):
+        """Return a synthetic refusal payload that the existing refusal
+        detection (pattern + LLM) will recognize. Matches the shape of
+        the streaming output (generator) when stream=True, plain string
+        otherwise."""
+        text = (
+            'I cannot translate this copyrighted material. '
+            'I would be happy to help with shorter excerpts from '
+            'copyrighted content.')
+        if self.stream:
+            return iter([text])
+        return text
+
     def translate(self, content):
         # Use dynamic timeout only if enabled (default: disabled)
         if self.enable_dynamic_timeout:
@@ -232,12 +261,113 @@ class ClaudeTranslate(GenAI):
 
             try:
                 return super().translate(content)
+            except Exception as e:
+                if self._is_content_filter_error(e):
+                    return self._content_filter_refusal()
+                raise
             finally:
                 # Restore original timeout
                 self.request_timeout = original_timeout
-        else:
+        try:
             # Use user-configured timeout (default 30s)
             return super().translate(content)
+        except Exception as e:
+            if self._is_content_filter_error(e):
+                return self._content_filter_refusal()
+            raise
+
+    def consistency_review(self, items):
+        """Pass-2 consistency review. Takes a list of {index, translation}
+        dicts representing the translated paragraphs (in order) and asks
+        the model to identify inconsistencies in character names, gender
+        forms, and recurring terminology. Returns a list of corrections in
+        the form {index, translation, reason}.
+
+        Sees only translated text — no copyright risk, since this is the
+        user's own translation output, not the original copyrighted book.
+        """
+        if not items:
+            return []
+
+        # Build the indexed input (one numbered block per paragraph)
+        input_text = '\n\n'.join(
+            '[{}] {}'.format(item['index'], item['translation'])
+            for item in items)
+
+        target_lang = self.target_lang
+        system_prompt = (
+            'You are reviewing a {tlang} translation of a book for '
+            'consistency. Identify paragraphs that contain inconsistencies '
+            'with the rest of the translation in:\n'
+            '1. Character name transliterations (the same person rendered '
+            'differently in different paragraphs)\n'
+            '2. Gender forms (masculine/feminine grammar for the same '
+            'character used inconsistently)\n'
+            '3. Recurring terminology (titles, places, specialized '
+            'vocabulary translated differently across paragraphs)\n\n'
+            'For each inconsistency, output a JSON object with the '
+            'paragraph index, a brief reason, and the full corrected '
+            'translation of that paragraph. Do not output paragraphs that '
+            'have no issues.\n\n'
+            'Output ONLY a JSON array, no other text or markdown:\n'
+            '[{{"index": <number>, "reason": "<brief explanation>", '
+            '"translation": "<full corrected paragraph text>"}}, ...]'
+        ).format(tlang=target_lang)
+
+        body = json.dumps({
+            'model': self.model,
+            'max_tokens': 64_000,
+            'temperature': 0,
+            'system': system_prompt,
+            'messages': [{'role': 'user', 'content': input_text}],
+        })
+
+        response = request(
+            self.endpoint,
+            data=body,
+            headers={
+                'Content-Type': 'application/json',
+                'anthropic-version': self.api_version,
+                'x-api-key': self.api_key,
+            },
+            method='POST',
+            timeout=max(int(self.request_timeout) * 4, 120),
+            proxy_uri=(
+                self.proxy_uri if self.proxy_type == 'http' else None),
+        )
+        result = json.loads(response)
+        raw_text = result['content'][0]['text'].strip()
+
+        # Try direct JSON parse; fall back to extracting an array from
+        # surrounding text (some models add commentary despite instructions).
+        try:
+            corrections_raw = json.loads(raw_text)
+        except json.JSONDecodeError:
+            import re as _re
+            match = _re.search(r'\[.*\]', raw_text, _re.DOTALL)
+            if not match:
+                return []
+            corrections_raw = json.loads(match.group())
+
+        if not isinstance(corrections_raw, list):
+            return []
+        valid_indices = {item['index'] for item in items}
+        corrections = []
+        for c in corrections_raw:
+            if not isinstance(c, dict):
+                continue
+            idx = c.get('index')
+            if idx not in valid_indices:
+                continue
+            new_text = c.get('translation', '').strip()
+            if not new_text:
+                continue
+            corrections.append({
+                'index': idx,
+                'translation': new_text,
+                'reason': c.get('reason', ''),
+            })
+        return corrections
 
     def get_models(self):
         model_endpoint = urljoin(self.endpoint, 'models')

@@ -265,6 +265,46 @@ class Translation:
                 return best
         raise ValueError(_('No acceptable split boundary found'))
 
+    def _translate_with_split(self, row, text, row_info):
+        """Single-split fallback. Splits text at \\n\\n closest to midpoint
+        (sentence boundary fallback) and translates each half with the
+        same retry logic. Returns the joined translation. Raises
+        RefusalExhausted if either half still refuses, or ValueError if
+        the text can't be split."""
+        xa, xb, joiner = self._split_text_for_retry(text)
+        self.log('\n'.join(filter(None, [
+            sep(),
+            row_info,
+            _('Splitting chunk and retrying each half '
+              '({} + {} chars)').format(len(xa), len(xb)),
+        ])), True)
+        ta = self._translate_chunk_with_refusal_retries(
+            row, xa, label=_('first half'))
+        tb = self._translate_chunk_with_refusal_retries(
+            row, xb, label=_('second half'))
+        return ta.rstrip() + joiner + tb.lstrip()
+
+    def _translate_without_cached_context(self, row, text, row_info):
+        """Last-resort fallback: retry the full chunk with the cached
+        book context temporarily disabled. The bare paragraph (no
+        reference text in the system prompt) is much less identifiable
+        as part of a specific copyrighted work."""
+        if not hasattr(self.translator, 'full_book_context'):
+            return self._translate_chunk_with_refusal_retries(
+                row, text, label=_('no context'))
+        saved = self.translator.full_book_context
+        self.translator.full_book_context = None
+        try:
+            self.log('\n'.join(filter(None, [
+                sep(),
+                row_info,
+                _('Final fallback: retrying without cached book context'),
+            ])), True)
+            return self._translate_chunk_with_refusal_retries(
+                row, text, label=_('no context'))
+        finally:
+            self.translator.full_book_context = saved
+
     def translate_paragraph(self, paragraph):
         if self.cancel_request():
             raise TranslationCanceled(_('Translation canceled.'))
@@ -276,34 +316,36 @@ class Translation:
         row_info = _('Row: {}').format(paragraph.row) \
             if paragraph.row >= 0 else ''
 
+        # Three-tier fallback chain:
+        #   1. Full chunk with cached context + retries
+        #   2. Split chunk into halves, each with retries (atomic)
+        #   3. Full chunk WITHOUT cached context (bare paragraph)
         try:
             translation = self._translate_chunk_with_refusal_retries(
                 paragraph.row, text)
         except RefusalExhausted as full_failure:
-            # Try a single split: translate first half (Xa), then second
-            # half (Xb) using the same retry logic. Atomic — both must
-            # succeed or the whole paragraph fails.
             try:
-                xa, xb, joiner = self._split_text_for_retry(text)
+                translation = self._translate_with_split(
+                    paragraph.row, text, row_info)
             except ValueError as split_err:
                 self.log('\n'.join(filter(None, [
                     sep(),
                     row_info,
-                    _('Cannot split chunk for retry: {}')
-                    .format(str(split_err)),
+                    _('Cannot split chunk: {}').format(str(split_err)),
                 ])), True)
-                raise full_failure
-            self.log('\n'.join(filter(None, [
-                sep(),
-                row_info,
-                _('Splitting chunk and retrying each half '
-                  '({} + {} chars)').format(len(xa), len(xb)),
-            ])), True)
-            ta = self._translate_chunk_with_refusal_retries(
-                paragraph.row, xa, label=_('first half'))
-            tb = self._translate_chunk_with_refusal_retries(
-                paragraph.row, xb, label=_('second half'))
-            translation = ta.rstrip() + joiner + tb.lstrip()
+                # Skip directly to no-context fallback
+                try:
+                    translation = self._translate_without_cached_context(
+                        paragraph.row, text, row_info)
+                except RefusalExhausted:
+                    raise full_failure
+            except RefusalExhausted:
+                # Split halves still refused — try without cached context
+                try:
+                    translation = self._translate_without_cached_context(
+                        paragraph.row, text, row_info)
+                except RefusalExhausted:
+                    raise full_failure
 
         paragraph.translation = translation.strip()
         # Apply aligment checking and processing.
@@ -337,6 +379,37 @@ class Translation:
                     message = _('Translation (Cached): {}')
                 self.log(message.format(paragraph.translation.strip()))
 
+    # Patterns that mark a paragraph as front-matter / identifying content.
+    # Paragraphs matching any of these are excluded from the cached book
+    # context (but still translated) to reduce the chance the model can
+    # identify the source as a specific copyrighted work and refuse.
+    _IDENTIFYING_PATTERNS = [
+        re.compile(r'©'),
+        re.compile(r'\bcopyright\b', re.IGNORECASE),
+        re.compile(r'\ball\s+rights\s+reserved\b', re.IGNORECASE),
+        re.compile(r'\bISBN\b'),
+        re.compile(r'\bfirst\s+(edition|published|printing)\b', re.IGNORECASE),
+        re.compile(r'\bpublished\s+by\b', re.IGNORECASE),
+        re.compile(r'library\s+of\s+congress', re.IGNORECASE),
+        re.compile(r'cataloging[- ]in[- ]publication', re.IGNORECASE),
+    ]
+
+    def _strip_identifying_content(self, paragraphs):
+        """Filter out paragraphs containing explicit identifying markers
+        (copyright notices, ISBN, publisher info) from the cached context.
+        Returns the filtered list and the count of stripped paragraphs.
+        Paragraphs are still translated — only excluded from the reference
+        context Claude sees."""
+        kept = []
+        stripped = 0
+        for p in paragraphs:
+            text = p.original or ''
+            if any(pat.search(text) for pat in self._IDENTIFYING_PATTERNS):
+                stripped += 1
+                continue
+            kept.append(p)
+        return kept, stripped
+
     def handle(self, paragraphs=[]):
         start_time = time.time()
         char_count = 0
@@ -347,11 +420,19 @@ class Translation:
         # Set up prompt caching if enabled
         # Collect full book context for caching (Claude only)
         if hasattr(self.translator, 'enable_prompt_caching') and self.translator.enable_prompt_caching:
-            full_context = '\n\n'.join([p.original for p in paragraphs])
+            cached_paragraphs, stripped = self._strip_identifying_content(
+                paragraphs)
+            full_context = '\n\n'.join(
+                [p.original for p in cached_paragraphs])
             self.translator.full_book_context = full_context
             self.log(sep())
             self.log(_('Prompt caching enabled - using full book context'))
             self.log(_('Context size: {} characters').format(len(full_context)))
+            if stripped > 0:
+                self.log(_(
+                    'Stripped {} identifying paragraph(s) (copyright notice, '
+                    'ISBN, etc.) from cached context to reduce refusal risk'
+                ).format(stripped))
 
         self.log(sep())
         self.log(_('Start to translate ebook content'))
@@ -369,6 +450,13 @@ class Translation:
             self.translator.request_interval)
         handler.handle()
 
+        # Pass-2 consistency review (Claude only, opt-in). Runs after the
+        # main translation completes. Reviews the translated text for
+        # inconsistencies (character names, gender, terminology) and
+        # applies corrections.
+        if not (self.batch and self.need_stop()):
+            self.consistency_pass(paragraphs)
+
         self.log(sep())
         if self.batch and self.need_stop():
             raise Exception(_('Translation failed.'))
@@ -376,6 +464,77 @@ class Translation:
         self.log(_('Time consuming: {} minutes').format(consuming))
         self.log(_('Translation completed.'))
         self.progress(1, _('Translation completed.'))
+
+    def consistency_pass(self, paragraphs):
+        """Run a Pass-2 consistency review over the translated paragraphs
+        if the engine supports it and the user has enabled the feature.
+        Identifies inconsistencies in character names, gender forms, and
+        terminology, then applies corrections to the paragraphs and
+        triggers the cache update via the existing callback."""
+        if not getattr(self.translator, 'enable_consistency_pass', False):
+            return
+        if not hasattr(self.translator, 'consistency_review'):
+            return
+        if self.cancel_request():
+            return
+
+        # Stable ordering: use the row attribute (or insertion order) so
+        # the index we send to the model lines up with our local lookup.
+        items = []
+        index_to_paragraph = {}
+        for i, p in enumerate(paragraphs):
+            if p.translation and p.error is None:
+                items.append({'index': i, 'translation': p.translation})
+                index_to_paragraph[i] = p
+
+        if not items:
+            return
+
+        self.log(sep())
+        self.log(_('Running consistency pass on {} paragraphs...')
+                 .format(len(items)))
+
+        try:
+            corrections = self.translator.consistency_review(items)
+        except Exception as e:
+            self.log(_('Consistency pass failed: {}').format(str(e)), True)
+            return
+
+        if not corrections:
+            self.log(_('Consistency pass: no inconsistencies found.'))
+            return
+
+        applied = 0
+        for c in corrections:
+            if self.cancel_request():
+                break
+            paragraph = index_to_paragraph.get(c['index'])
+            if paragraph is None:
+                continue
+            old_translation = paragraph.translation
+            paragraph.translation = c['translation']
+            if self.translator.merge_enabled:
+                paragraph.do_aligment(self.translator.separator)
+            applied += 1
+            row_label = (paragraph.row if paragraph.row >= 0
+                         else c['index'])
+            self.log(sep('┈'))
+            self.log(_('Corrected row {}: {}')
+                     .format(row_label, c.get('reason', '')))
+            if get_config().get('log_content', True):
+                before = old_translation[:200] + (
+                    '...' if len(old_translation) > 200 else '')
+                after = paragraph.translation[:200] + (
+                    '...' if len(paragraph.translation) > 200 else '')
+                self.log(_('Before: {}').format(before))
+                self.log(_('After:  {}').format(after))
+            # Trigger cache update + UI refresh through the existing
+            # callback (advanced.py's translation_callback handles this).
+            self.callback(paragraph)
+
+        self.log(sep('┈'))
+        self.log(_('Consistency pass: applied {} correction(s).')
+                 .format(applied))
 
 
 def get_engine_class(engine_name=None):

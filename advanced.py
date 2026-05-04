@@ -165,6 +165,8 @@ class TranslationWorker(QObject):
     close = pyqtSignal(int)
     finished = pyqtSignal()
     translate = pyqtSignal(list, bool)
+    consistency = pyqtSignal(list)
+    consistency_completed = pyqtSignal()
     logging = pyqtSignal(str, bool)
     # error = pyqtSignal(str, str, str)
     streaming = pyqtSignal(object)
@@ -180,6 +182,7 @@ class TranslationWorker(QObject):
         self.canceled = False
         self.need_close = False
         self.translate.connect(self.translate_paragraphs)
+        self.consistency.connect(self.run_consistency_pass)
         # self.finished.connect(lambda: self.set_canceled(False))
 
     def set_source_lang(self, lang):
@@ -221,6 +224,33 @@ class TranslationWorker(QObject):
         if self.need_close:
             time.sleep(0.5)
             self.close.emit(0)
+
+    @pyqtSlot(list)
+    def run_consistency_pass(self, paragraphs=[]):
+        """Run only the Pass-2 consistency review on already-translated
+        paragraphs. Skips the regular translation flow entirely."""
+        self.on_working = True
+        self.start.emit()
+        translator = get_translator(self.current_engine)
+        translator.set_source_lang(self.source_lang)
+        translator.set_target_lang(self.target_lang)
+        # Force-enable consistency pass for this invocation, even if the
+        # user toggled the setting off after pressing the button.
+        translator.enable_consistency_pass = True
+        translation = get_translation(translator)
+        translation.set_logging(
+            lambda text, error=False: self.logging.emit(text, error))
+        translation.set_streaming(self.streaming.emit)
+        translation.set_callback(self.callback.emit)
+        translation.set_cancel_request(self.cancel_request)
+        try:
+            translation.consistency_pass(paragraphs)
+            # Notify subscribers (UI uses this to record the run timestamp
+            # in the cache and refresh the button tooltip).
+            self.consistency_completed.emit()
+        finally:
+            self.on_working = False
+            self.finished.emit()
 
 
 class CreateTranslationProject(QDialog):
@@ -721,20 +751,29 @@ class AdvancedTranslation(QDialog):
         delete_button.setToolTip(delete_button.text() + ' [Del]')
         batch_translation = QPushButton(
             ' %s (%s)' % (_('Batch Translation'), _('Beta')))
+        consistency_pass_button = QPushButton(
+            '  %s  ' % _('Consistency Pass'))
         translate_all = QPushButton('  %s  ' % _('Translate All'))
         translate_untranslated = QPushButton(
             '  %s  ' % _('Translate Untranslated'))
         translate_selected = QPushButton('  %s  ' % _('Translate Selected'))
 
         delete_button.clicked.connect(self.table.delete_selected_rows)
+        consistency_pass_button.clicked.connect(
+            self.run_consistency_pass)
         translate_all.clicked.connect(self.translate_all_paragraphs)
         translate_untranslated.clicked.connect(
             self.translate_untranslated_paragraphs)
         translate_selected.clicked.connect(self.translate_selected_paragraph)
 
+        # Track the button so update_consistency_pass_button() can read its
+        # state.
+        self.consistency_pass_button = consistency_pass_button
+
         action_layout.addWidget(delete_button)
         action_layout.addStretch(1)
         action_layout.addWidget(batch_translation)
+        action_layout.addWidget(consistency_pass_button)
         action_layout.addWidget(translate_all)
         action_layout.addWidget(translate_untranslated)
         action_layout.addWidget(translate_selected)
@@ -749,10 +788,73 @@ class AdvancedTranslation(QDialog):
         delete_button.setDisabled(True)
         translate_selected.setDisabled(True)
 
+        # Consistency pass: visible only for Claude with the feature
+        # enabled; enabled only when ALL paragraphs have translations
+        # (the pass needs the full picture to extract a coherent
+        # glossary and find inconsistencies).
+        consistency_pass_button.setVisible(False)
+
+        def _last_consistency_pass_label():
+            """Return a human-readable 'Last run: ...' string from cache,
+            or 'never' if no record exists."""
+            ts = None
+            if self.cache is not None:
+                ts = self.cache.get_info('last_consistency_pass')
+            if not ts:
+                return _('never')
+            return ts
+
+        def update_consistency_pass_button():
+            from .engines.anthropic import ClaudeTranslate
+            engine_class = self.current_engine
+            visible = (
+                engine_class is not None
+                and issubclass(engine_class, ClaudeTranslate)
+                and getattr(engine_class, 'config', {}).get(
+                    'enable_consistency_pass',
+                    getattr(engine_class, 'enable_consistency_pass', False))
+            )
+            consistency_pass_button.setVisible(visible)
+            if not visible:
+                return
+            # Enable only if every paragraph has a translation. Iterate
+            # the table model directly to avoid the overhead of building
+            # a full Paragraph list each time.
+            total_rows = self.table.rowCount()
+            all_translated = total_rows > 0 and all(
+                self.table.paragraph(r).translation
+                for r in range(total_rows))
+            consistency_pass_button.setEnabled(all_translated)
+            if all_translated:
+                consistency_pass_button.setToolTip(_(
+                    'Run the consistency review pass over all '
+                    'translations (Claude only).\nLast run: {}'
+                ).format(_last_consistency_pass_label()))
+            else:
+                consistency_pass_button.setToolTip(_(
+                    'Disabled until all paragraphs have a translation '
+                    '— the consistency pass needs the full text to '
+                    'identify inconsistencies.'))
+
+        # Save references the callback chain can reach.
+        self.update_consistency_pass_button = update_consistency_pass_button
+
+        def record_consistency_pass_time():
+            """Persist the run timestamp in cache info so it survives
+            plugin reloads, and refresh the button tooltip."""
+            from datetime import datetime
+            ts = datetime.now().strftime('%Y-%m-%d %H:%M')
+            if self.cache is not None:
+                self.cache.set_info('last_consistency_pass', ts)
+            update_consistency_pass_button()
+        self.trans_worker.consistency_completed.connect(
+            record_consistency_pass_time)
+
         self.batch_translation.connect(
             lambda: batch_translation.setVisible(
                 self.current_engine == ChatgptTranslate))
         self.batch_translation.emit()
+        update_consistency_pass_button()
 
         def start_batch_translation():
             translator = get_translator(self.current_engine)
@@ -799,6 +901,11 @@ class AdvancedTranslation(QDialog):
         def working_finished():
             stack.setCurrentWidget(action_widget)
             action_widget.setDisabled(False)
+            # The action_widget re-enable also re-enables the consistency
+            # pass button unconditionally; reapply the "all translated"
+            # gate so it only stays enabled when appropriate.
+            if hasattr(self, 'update_consistency_pass_button'):
+                self.update_consistency_pass_button()
         self.trans_worker.finished.connect(working_finished)
 
         return stack
@@ -1137,6 +1244,11 @@ class AdvancedTranslation(QDialog):
             if self.cache is not None:
                 self.cache.update_paragraph(paragraph)
             self.progress_bar.emit()
+            # Refresh consistency-pass button state — translation status
+            # of one paragraph just changed, which may flip the
+            # "all translated" predicate.
+            if hasattr(self, 'update_consistency_pass_button'):
+                self.update_consistency_pass_button()
 
         self.trans_worker.callback.connect(translation_callback)
 
@@ -1331,6 +1443,26 @@ class AdvancedTranslation(QDialog):
             return
         self.translate_all = True
         self.trans_worker.translate.emit(paragraphs, False)
+
+    def run_consistency_pass(self):
+        """Run only the Pass-2 consistency review on already-translated
+        paragraphs. Re-translation is skipped — only the consistency
+        review and corrections happen."""
+        paragraphs = self.table.get_selected_paragraphs(False, True)
+        # Defensive check (button should already be disabled if any are
+        # missing translations, but cover the race where a translation
+        # callback hasn't propagated yet).
+        if any(not p.translation for p in paragraphs):
+            self.alert.pop(
+                _('Cannot run consistency pass while some paragraphs '
+                  'are still untranslated.'), 'info')
+            return
+        if len(paragraphs) < 1:
+            return
+        # Progress reporting expects a step value; use 1/N like the other
+        # actions so the bar moves as the consistency pass logs progress.
+        self.progress_step = self.get_progress_step(len(paragraphs))
+        self.trans_worker.consistency.emit(paragraphs)
 
     def translate_selected_paragraph(self):
         paragraphs = self.table.get_selected_paragraphs()

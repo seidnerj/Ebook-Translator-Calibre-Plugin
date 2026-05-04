@@ -372,122 +372,137 @@ class ClaudeTranslate(GenAI):
             raw_object=True,
         )
 
-        # Collect streamed text. Mirrors _parse_stream but accumulates
-        # the entire output instead of yielding chunks. We surface
-        # lifecycle events so the user can distinguish the "model is
-        # processing input" phase (no text yet, just pings) from active
-        # output generation.
+        # Collect streamed text. Decouples blocking I/O from the main
+        # loop using a reader thread + queue, so we can check
+        # cancel_request every 100ms regardless of how long any single
+        # readline() takes. Also surfaces lifecycle events so the user
+        # can distinguish the "model is processing input" phase from
+        # active output generation.
+        import threading
+        import queue as _queue
         if on_progress:
             on_progress(_('Streaming response from model — '
                           'large prompts may take 30-60s before output '
                           'starts...'))
         chunks = []
         chars_received = 0
-        # Heartbeat: log a progress line every 500 chars after output
-        # begins. Chosen to balance signal vs. noise — typical full
-        # responses are 5K-50K chars, giving 10-100 progress lines.
         progress_step = 500
         next_progress_at = progress_step
         ping_count = 0
         output_started = False
 
-        # Cancellation watchdog. readline() is a blocking call — during
-        # the input-processing phase Anthropic only sends pings every
-        # 15-30s, so checking cancel_request between readlines means
-        # Stop could appear frozen for that long. The watchdog polls
-        # cancel_request on a short interval and closes the response
-        # when triggered, which causes the blocked readline to raise
-        # immediately.
-        import threading
-        cancellation_watchdog_stop = threading.Event()
-        cancellation_was_requested = [False]  # mutable flag
+        # Reader thread feeds raw lines into a queue. Daemonized so it
+        # can't block process exit.
+        read_queue: _queue.Queue = _queue.Queue()
+        reader_done = threading.Event()
+        EOF = object()
+        ERR = object()
 
-        def _cancellation_watchdog():
-            while not cancellation_watchdog_stop.is_set():
+        def _reader():
+            try:
+                while not reader_done.is_set():
+                    raw = response.readline()
+                    if not raw:
+                        read_queue.put((EOF, None))
+                        return
+                    read_queue.put(('line', raw))
+            except Exception as e:
+                read_queue.put((ERR, e))
+
+        reader_thread = threading.Thread(target=_reader, daemon=True)
+        reader_thread.start()
+
+        # Idle heartbeat — if we go too long with nothing on the queue,
+        # log a "still waiting" message so the user knows we haven't
+        # silently hung.
+        idle_seconds_so_far = 0.0
+        idle_log_interval = 15.0  # log every 15s of pure silence
+        last_idle_log = 0.0
+
+        try:
+            while True:
+                # Cancellation check — runs every 100ms regardless of
+                # I/O state.
                 if cancel_request is not None and cancel_request():
-                    cancellation_was_requested[0] = True
                     try:
                         response.close()
                     except Exception:
                         pass
-                    return
-                # 100ms poll — responsive enough for UX, light enough
-                # not to hammer the CPU.
-                cancellation_watchdog_stop.wait(0.1)
+                    from ..lib.exception import TranslationCanceled as _TC
+                    raise _TC(_('Translation canceled.'))
 
-        watchdog = None
-        if cancel_request is not None:
-            watchdog = threading.Thread(
-                target=_cancellation_watchdog, daemon=True)
-            watchdog.start()
+                try:
+                    kind, payload = read_queue.get(timeout=0.1)
+                except _queue.Empty:
+                    idle_seconds_so_far += 0.1
+                    if (on_progress and
+                            idle_seconds_so_far - last_idle_log
+                            >= idle_log_interval):
+                        on_progress(_('  ...still waiting for first '
+                                      'response chunk ({:.0f}s elapsed)')
+                                    .format(idle_seconds_so_far))
+                        last_idle_log = idle_seconds_so_far
+                    continue
 
-        while True:
+                # Got something — reset idle counter.
+                idle_seconds_so_far = 0.0
+                last_idle_log = 0.0
+
+                if kind is EOF:
+                    break
+                if kind is ERR:
+                    break  # Loop exit; cancellation/raw_response handled below
+
+                line = payload.decode('utf-8').strip()
+                if not line.startswith('data:'):
+                    continue
+                try:
+                    evt = json.loads(line.split('data: ', 1)[1])
+                except (IndexError, json.JSONDecodeError):
+                    continue
+                etype = evt.get('type')
+                if etype == 'message_stop':
+                    break
+                if etype == 'message_start':
+                    if on_progress:
+                        on_progress(_('  Model accepted request, '
+                                      'processing input...'))
+                elif etype == 'content_block_start':
+                    if on_progress:
+                        on_progress(_('  Output started, streaming...'))
+                    output_started = True
+                elif etype == 'content_block_delta':
+                    delta = evt.get('delta') or {}
+                    text = delta.get('text')
+                    if text:
+                        s = str(text)
+                        chunks.append(s)
+                        chars_received += len(s)
+                        if (on_progress
+                                and chars_received >= next_progress_at):
+                            on_progress(_('  ...{} characters received')
+                                        .format(chars_received))
+                            next_progress_at = chars_received + progress_step
+                elif etype == 'ping':
+                    # Each ping confirms the connection is alive while
+                    # the model is still processing input. Log every
+                    # ping (they're typically every 30-60s) so the user
+                    # can see activity well before output begins.
+                    ping_count += 1
+                    if not output_started and on_progress:
+                        on_progress(_('  ...keepalive ping #{} received')
+                                    .format(ping_count))
+                elif etype == 'error':
+                    raise Exception(
+                        _('Consistency review error: {}').format(
+                            evt.get('error', {}).get(
+                                'message', 'unknown')))
+        finally:
+            reader_done.set()
             try:
-                line = response.readline().decode('utf-8').strip()
-            except IncompleteRead:
-                continue
+                response.close()
             except Exception:
-                # readline raised — either natural EOF or watchdog
-                # closed the response. Break out and check cancellation
-                # state below.
-                break
-            if not line.startswith('data:'):
-                continue
-            try:
-                evt = json.loads(line.split('data: ', 1)[1])
-            except (IndexError, json.JSONDecodeError):
-                continue
-            etype = evt.get('type')
-            if etype == 'message_stop':
-                break
-            if etype == 'message_start':
-                # Confirms Anthropic accepted the request and is now
-                # processing the prompt.
-                if on_progress:
-                    on_progress(_('  Model accepted request, '
-                                  'processing input...'))
-            elif etype == 'content_block_start':
-                if on_progress:
-                    on_progress(_('  Output started, streaming...'))
-                output_started = True
-            elif etype == 'content_block_delta':
-                delta = evt.get('delta') or {}
-                text = delta.get('text')
-                if text:
-                    s = str(text)
-                    chunks.append(s)
-                    chars_received += len(s)
-                    if on_progress and chars_received >= next_progress_at:
-                        on_progress(_('  ...{} characters received')
-                                    .format(chars_received))
-                        next_progress_at = chars_received + progress_step
-            elif etype == 'ping':
-                # Anthropic sends ping events as keepalive while
-                # processing input. Log one heartbeat every 10 pings so
-                # the user can see the connection is alive even before
-                # output starts.
-                ping_count += 1
-                if not output_started and on_progress and ping_count % 10 == 0:
-                    on_progress(_('  ...still processing input '
-                                  '({} keepalive pings)').format(ping_count))
-            elif etype == 'error':
-                # Tear down the watchdog before raising so the thread
-                # exits cleanly.
-                cancellation_watchdog_stop.set()
-                if watchdog is not None:
-                    watchdog.join(timeout=1)
-                raise Exception(_('Consistency review error: {}').format(
-                    evt.get('error', {}).get('message', 'unknown')))
-
-        # Loop exited — clean up the watchdog and check whether we
-        # exited because of cancellation or natural completion.
-        cancellation_watchdog_stop.set()
-        if watchdog is not None:
-            watchdog.join(timeout=1)
-        if cancellation_was_requested[0] or (
-                cancel_request is not None and cancel_request()):
-            from ..lib.exception import TranslationCanceled as _TC
-            raise _TC(_('Translation canceled.'))
+                pass
 
         raw_text = ''.join(chunks).strip()
         if on_progress:

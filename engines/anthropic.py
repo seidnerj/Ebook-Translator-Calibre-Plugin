@@ -390,22 +390,46 @@ class ClaudeTranslate(GenAI):
         next_progress_at = progress_step
         ping_count = 0
         output_started = False
+
+        # Cancellation watchdog. readline() is a blocking call — during
+        # the input-processing phase Anthropic only sends pings every
+        # 15-30s, so checking cancel_request between readlines means
+        # Stop could appear frozen for that long. The watchdog polls
+        # cancel_request on a short interval and closes the response
+        # when triggered, which causes the blocked readline to raise
+        # immediately.
+        import threading
+        cancellation_watchdog_stop = threading.Event()
+        cancellation_was_requested = [False]  # mutable flag
+
+        def _cancellation_watchdog():
+            while not cancellation_watchdog_stop.is_set():
+                if cancel_request is not None and cancel_request():
+                    cancellation_was_requested[0] = True
+                    try:
+                        response.close()
+                    except Exception:
+                        pass
+                    return
+                # 100ms poll — responsive enough for UX, light enough
+                # not to hammer the CPU.
+                cancellation_watchdog_stop.wait(0.1)
+
+        watchdog = None
+        if cancel_request is not None:
+            watchdog = threading.Thread(
+                target=_cancellation_watchdog, daemon=True)
+            watchdog.start()
+
         while True:
-            # Honor cancellation between reads. Each readline() blocks
-            # until the next SSE chunk arrives (~50-100ms), so the user
-            # sees Stop take effect within roughly that window.
-            if cancel_request is not None and cancel_request():
-                try:
-                    response.close()
-                except Exception:
-                    pass
-                from ..lib.exception import TranslationCanceled as _TC
-                raise _TC(_('Translation canceled.'))
             try:
                 line = response.readline().decode('utf-8').strip()
             except IncompleteRead:
                 continue
             except Exception:
+                # readline raised — either natural EOF or watchdog
+                # closed the response. Break out and check cancellation
+                # state below.
                 break
             if not line.startswith('data:'):
                 continue
@@ -447,8 +471,24 @@ class ClaudeTranslate(GenAI):
                     on_progress(_('  ...still processing input '
                                   '({} keepalive pings)').format(ping_count))
             elif etype == 'error':
+                # Tear down the watchdog before raising so the thread
+                # exits cleanly.
+                cancellation_watchdog_stop.set()
+                if watchdog is not None:
+                    watchdog.join(timeout=1)
                 raise Exception(_('Consistency review error: {}').format(
                     evt.get('error', {}).get('message', 'unknown')))
+
+        # Loop exited — clean up the watchdog and check whether we
+        # exited because of cancellation or natural completion.
+        cancellation_watchdog_stop.set()
+        if watchdog is not None:
+            watchdog.join(timeout=1)
+        if cancellation_was_requested[0] or (
+                cancel_request is not None and cancel_request()):
+            from ..lib.exception import TranslationCanceled as _TC
+            raise _TC(_('Translation canceled.'))
+
         raw_text = ''.join(chunks).strip()
         if on_progress:
             on_progress(_('  ...complete: {} characters total')

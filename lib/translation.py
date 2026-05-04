@@ -501,16 +501,36 @@ class Translation:
             return
 
         # Backwards compatibility: older return shape was a flat list of
-        # corrections. New shape is {'glossary': [...], 'corrections': [...]}.
+        # corrections. New shape is {'glossary': [...], 'corrections': [...],
+        # 'raw_response': '...'}.
         if isinstance(review, list):
             glossary = []
             corrections = review
+            raw_response = ''
         elif isinstance(review, dict):
             glossary = review.get('glossary') or []
             corrections = review.get('corrections') or []
+            raw_response = review.get('raw_response') or ''
         else:
             glossary = []
             corrections = []
+            raw_response = ''
+
+        # Confirmation line so the user can tell empty results apart from
+        # "the response didn't parse" or "we received nothing".
+        self.log(sep('┈'))
+        self.log(_('Received from model: {} glossary entries, {} '
+                   'corrections.').format(len(glossary), len(corrections)))
+
+        # If we received nothing AND have a raw response, surface a
+        # truncated excerpt so the user can see what the model actually
+        # said (e.g. malformed JSON, refusal text, etc.).
+        if not glossary and not corrections and raw_response:
+            excerpt = raw_response[:1000] + (
+                '...' if len(raw_response) > 1000 else '')
+            self.log(_('Raw response (parsing produced no usable '
+                       'output):'), True)
+            self.log(excerpt, True)
 
         # Log the extracted glossary for transparency. This shows the user
         # what canonical translations the model used as the consistency
@@ -551,12 +571,11 @@ class Translation:
             self.log(_('Corrected row {}: {}')
                      .format(row_label, c.get('reason', '')))
             if get_config().get('log_content', True):
-                before = old_translation[:200] + (
-                    '...' if len(old_translation) > 200 else '')
-                after = paragraph.translation[:200] + (
-                    '...' if len(paragraph.translation) > 200 else '')
-                self.log(_('Before: {}').format(before))
-                self.log(_('After:  {}').format(after))
+                # Show full before/after — the consistency pass typically
+                # produces 5-30 corrections, not hundreds, so verbose
+                # output is helpful rather than overwhelming.
+                self.log(_('Before: {}').format(old_translation))
+                self.log(_('After:  {}').format(paragraph.translation))
             # Trigger cache update + UI refresh through the existing
             # callback (advanced.py's translation_callback handles this).
             self.callback(paragraph)

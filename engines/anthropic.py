@@ -401,7 +401,15 @@ class ClaudeTranslate(GenAI):
                 except json.JSONDecodeError:
                     parsed = None
         if not isinstance(parsed, dict):
-            return {'glossary': [], 'corrections': []}
+            # Always include the raw response so the orchestrator can
+            # surface it to the log when parsing fails — this avoids the
+            # silent "no inconsistencies found" outcome that's
+            # indistinguishable from genuine zero-corrections.
+            return {
+                'glossary': [],
+                'corrections': [],
+                'raw_response': raw_text,
+            }
 
         # Validate glossary
         glossary_raw = parsed.get('glossary') or []
@@ -441,7 +449,15 @@ class ClaudeTranslate(GenAI):
                     'reason': (c.get('reason') or '').strip(),
                 })
 
-        return {'glossary': glossary, 'corrections': corrections}
+        return {
+            'glossary': glossary,
+            'corrections': corrections,
+            # Include raw response only when both parsed buckets ended up
+            # empty — otherwise the JSON parsed fine and the raw text is
+            # not useful (just noise that crowds the log).
+            'raw_response': (raw_text
+                             if not glossary and not corrections else ''),
+        }
 
     def get_models(self):
         model_endpoint = urljoin(self.endpoint, 'models')

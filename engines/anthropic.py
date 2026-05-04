@@ -276,7 +276,8 @@ class ClaudeTranslate(GenAI):
                 return self._content_filter_refusal()
             raise
 
-    def consistency_review(self, items, on_progress=None):
+    def consistency_review(self, items, on_progress=None,
+                           cancel_request=None):
         """Pass-2 consistency review. Takes a list of {index, translation}
         dicts representing the translated paragraphs (in order) and asks
         the model to identify inconsistencies in character names, gender
@@ -286,6 +287,12 @@ class ClaudeTranslate(GenAI):
             the streaming response so the caller can surface progress to
             the user. The model can take many minutes to produce a full
             review — without progress feedback the UI looks frozen.
+
+        :cancel_request: optional callable() returning True when the user
+            has requested cancellation. Checked between SSE event reads
+            so Stop is responsive within ~1 second of the next chunk
+            arriving (chunks arrive every 50-100ms during normal
+            streaming).
 
         Returns a dict with three keys:
           - 'glossary': list of {term, canonical, type, notes} entries
@@ -379,6 +386,16 @@ class ClaudeTranslate(GenAI):
         progress_step = 500
         next_progress_at = progress_step
         while True:
+            # Honor cancellation between reads. Each readline() blocks
+            # until the next SSE chunk arrives (~50-100ms), so the user
+            # sees Stop take effect within roughly that window.
+            if cancel_request is not None and cancel_request():
+                try:
+                    response.close()
+                except Exception:
+                    pass
+                from ..lib.exception import TranslationCanceled as _TC
+                raise _TC(_('Translation canceled.'))
             try:
                 line = response.readline().decode('utf-8').strip()
             except IncompleteRead:

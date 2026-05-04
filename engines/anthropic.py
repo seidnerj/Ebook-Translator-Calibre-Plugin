@@ -622,9 +622,22 @@ class ClaudeTranslate(GenAI):
                     if (on_progress and
                             idle_seconds_so_far - last_idle_log
                             >= idle_log_interval):
-                        on_progress(_('  ...still waiting for first '
-                                      'response chunk ({:.0f}s elapsed)')
-                                    .format(idle_seconds_so_far))
+                        # Different message depending on whether we've
+                        # already received data — the model produces
+                        # output in bursts with thinking pauses between
+                        # sections, so silence after data has flowed is
+                        # normal (not an indication something is stuck).
+                        if chars_received > 0:
+                            on_progress(_(
+                                '  ...no new chunks for {:.0f}s '
+                                '(model is thinking between sections — '
+                                'received {} chars so far)'
+                            ).format(idle_seconds_so_far, chars_received))
+                        else:
+                            on_progress(_(
+                                '  ...still waiting for first response '
+                                'chunk ({:.0f}s elapsed)'
+                            ).format(idle_seconds_so_far))
                         last_idle_log = idle_seconds_so_far
                     continue
 

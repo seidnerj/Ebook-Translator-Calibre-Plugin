@@ -849,6 +849,20 @@ class TranslationSetting(QDialog):
             consistency_pass_enabled.setVisible(False)
 
             if issubclass(self.current_engine, ClaudeTranslate):
+                # Guidance on the model selector: different Claude models
+                # have different copyright-filter sensitivity, so the user
+                # can try alternatives if they hit frequent refusals.
+                genai_model_list.setToolTip(_(
+                    'Different Claude models have different content '
+                    'filter sensitivity. If you encounter frequent '
+                    'copyright-related translation refusals, try a '
+                    'different model — older versions of the same tier '
+                    '(e.g. Sonnet 4.x vs. 4.6) may refuse less often '
+                    'for the same content.'))
+            else:
+                genai_model_list.setToolTip('')
+
+            if issubclass(self.current_engine, ClaudeTranslate):
                 # Load configuration values
                 self.extended_output_enabled.setChecked(
                     config.get('enable_extended_output',

@@ -463,24 +463,49 @@ class ClaudeTranslate(GenAI):
         # _CONSISTENCY_TOOL_SCHEMA, instead of trusting the model to
         # follow JSON-format instructions in the prompt.
         #
-        # Prompt caching is TEMPORARILY DISABLED while we isolate a
-        # mid-stream stall observed in v2.4.16. If the stall stops with
-        # caching off, the bug is in the cache_control + tool_use +
-        # streaming combination; we'll re-enable once root-caused.
+        # Prompt caching marks the user message + tool definition as
+        # cacheable. On a retry within the 5-minute TTL, the second
+        # request reads the cache at 10% input cost. We always cache
+        # for the consistency pass — the caching is on our own
+        # translation output, no copyright concern, and the savings
+        # are substantial for retry scenarios.
+        #
+        # Note: an earlier mid-stream stall around ~3500 chars was
+        # initially suspected to be caching-related but reproduces with
+        # caching off too — likely a server-side or model-side issue
+        # with this specific request shape, not our caching config.
         body = json.dumps({
             'model': self.model,
             'max_tokens': 64_000,
             'temperature': 0,
             'stream': True,
-            'system': system_prompt,
-            'tools': [self._CONSISTENCY_TOOL_SCHEMA],
+            'system': [
+                {
+                    'type': 'text',
+                    'text': system_prompt,
+                }
+            ],
+            'tools': [
+                # cache_control on the tool definition caches it across
+                # retries (tools array stays identical).
+                dict(self._CONSISTENCY_TOOL_SCHEMA,
+                     **{'cache_control': {'type': 'ephemeral'}})
+            ],
             'tool_choice': {
                 'type': 'tool',
                 'name': self._CONSISTENCY_TOOL_NAME,
             },
             'messages': [{
                 'role': 'user',
-                'content': input_text,
+                'content': [
+                    {
+                        'type': 'text',
+                        'text': input_text,
+                        # cache_control on the user message caches the
+                        # large paragraph payload — the biggest win.
+                        'cache_control': {'type': 'ephemeral'},
+                    }
+                ],
             }],
         })
 
@@ -497,8 +522,12 @@ class ClaudeTranslate(GenAI):
                 'Content-Type': 'application/json',
                 'anthropic-version': self.api_version,
                 'x-api-key': self.api_key,
-                # Prompt caching beta header temporarily removed — see
-                # body comment above.
+                # Always enable prompt caching for the consistency pass
+                # regardless of the user's translation-time setting.
+                # The cache is over our own translation output (not the
+                # original copyrighted source), and the savings on
+                # retries are substantial.
+                'anthropic-beta': 'prompt-caching-2024-07-31',
             },
             method='POST',
         )

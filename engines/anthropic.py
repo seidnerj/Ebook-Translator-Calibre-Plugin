@@ -276,18 +276,25 @@ class ClaudeTranslate(GenAI):
                 return self._content_filter_refusal()
             raise
 
-    def consistency_review(self, items):
+    def consistency_review(self, items, on_progress=None):
         """Pass-2 consistency review. Takes a list of {index, translation}
         dicts representing the translated paragraphs (in order) and asks
         the model to identify inconsistencies in character names, gender
         forms, and recurring terminology.
 
-        Returns a dict with two keys:
+        :on_progress: optional callable(message) invoked at each phase of
+            the streaming response so the caller can surface progress to
+            the user. The model can take many minutes to produce a full
+            review — without progress feedback the UI looks frozen.
+
+        Returns a dict with three keys:
           - 'glossary': list of {term, canonical, type, notes} entries
             describing the canonical translations the model used as the
             consistency reference. Logged for transparency.
           - 'corrections': list of {index, translation, reason} entries
             for paragraphs that need correction.
+          - 'raw_response': raw model output text, populated when parsing
+            failed or yielded zero usable items.
 
         Sees only translated text — no copyright risk, since this is the
         user's own translation output, not the original copyrighted book.
@@ -360,7 +367,17 @@ class ClaudeTranslate(GenAI):
 
         # Collect streamed text. Mirrors _parse_stream but accumulates
         # the entire output instead of yielding chunks.
+        if on_progress:
+            on_progress(_('Streaming response from model — '
+                          'this can take several minutes for long books...'))
         chunks = []
+        chars_received = 0
+        # Heartbeat: log a progress line every 500 chars so the user can
+        # see the response materializing. Chosen to balance signal vs.
+        # noise — typical full responses are 5K-50K chars, giving 10-100
+        # progress lines.
+        progress_step = 500
+        next_progress_at = progress_step
         while True:
             try:
                 line = response.readline().decode('utf-8').strip()
@@ -381,11 +398,20 @@ class ClaudeTranslate(GenAI):
                 delta = evt.get('delta') or {}
                 text = delta.get('text')
                 if text:
-                    chunks.append(str(text))
+                    s = str(text)
+                    chunks.append(s)
+                    chars_received += len(s)
+                    if on_progress and chars_received >= next_progress_at:
+                        on_progress(_('  ...{} characters received')
+                                    .format(chars_received))
+                        next_progress_at = chars_received + progress_step
             elif etype == 'error':
                 raise Exception(_('Consistency review error: {}').format(
                     evt.get('error', {}).get('message', 'unknown')))
         raw_text = ''.join(chunks).strip()
+        if on_progress:
+            on_progress(_('  ...complete: {} characters total')
+                        .format(chars_received))
 
         # Try direct JSON parse; fall back to extracting an object from
         # surrounding text (some models add commentary despite instructions).

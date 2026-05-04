@@ -12,7 +12,8 @@ from ..engines.custom import CustomTranslate
 
 from .utils import log, sep, trim, dummy, traceback_error
 from .config import get_config
-from .exception import TranslationFailed, TranslationCanceled
+from .exception import (
+    TranslationFailed, TranslationCanceled, RefusalExhausted)
 from .handler import Handler
 
 
@@ -152,6 +153,118 @@ class Translation:
             time.sleep(interval)
             return self.translate_text(row, text, retry, interval)
 
+    # Minimum chunk size (characters) below which we won't split further.
+    MIN_SPLIT_CHUNK_SIZE = 200
+
+    def _consume_streaming(self, generator):
+        """Consume a streaming generator and return the full text. Honors
+        cancellation requests and emits chars to the streaming UI when
+        translating a single paragraph."""
+        if self.total == 1:
+            temp = ''
+            clear = True
+            for char in generator:
+                if self.cancel_request():
+                    raise TranslationCanceled(_('Translation canceled.'))
+                if clear:
+                    self.streaming('')
+                    clear = False
+                self.streaming(char)
+                time.sleep(0.05)
+                temp += char
+            return temp
+        temp_chars = []
+        for char in generator:
+            if self.cancel_request():
+                raise TranslationCanceled(_('Translation canceled.'))
+            temp_chars.append(char)
+        return ''.join(temp_chars)
+
+    def _translate_chunk_with_refusal_retries(self, row, text, label=''):
+        """Translate one chunk with refusal-detection retries. Returns the
+        glossary-restored translation. Raises RefusalExhausted if all
+        retries fail due to refusals; other exceptions propagate."""
+        refusal_retries = getattr(
+            self.translator, 'refusal_max_retries', 0)
+        translation = ''
+        for refusal_attempt in range(refusal_retries + 1):
+            self.streaming('')
+            self.streaming(_('Translating...'))
+            translation = self.translate_text(row, text)
+            if isinstance(translation, GeneratorType):
+                translation = self._consume_streaming(translation)
+            translation = self.glossary.restore(translation)
+
+            if not (hasattr(self.translator, 'is_translation_refusal')
+                    and self.translator.is_translation_refusal(translation)):
+                return translation
+
+            logged = translation[:200]
+            if len(translation) > 200:
+                logged += '...'
+            row_info = _('Row: {}').format(row) if row >= 0 else ''
+            chunk_info = '[{}] '.format(label) if label else ''
+            if refusal_attempt < refusal_retries:
+                self.log('\n'.join(filter(None, [
+                    sep(),
+                    row_info,
+                    _('{}Translation refusal detected, retrying ({}/{})')
+                    .format(chunk_info, refusal_attempt + 1, refusal_retries),
+                    sep('┈'),
+                    _('Response: {}').format(logged),
+                ])), True)
+                time.sleep(2)
+                continue
+            raise RefusalExhausted(
+                _('{}Translation refused after {} retries. {} Response: {}')
+                .format(
+                    chunk_info,
+                    refusal_retries,
+                    row_info + '.' if row_info else '',
+                    logged))
+        return translation
+
+    def _split_text_for_retry(self, text):
+        """Split text in half at the boundary closest to the midpoint that
+        best preserves paragraph structure. Tries the merge separator
+        ('\\n\\n') first, then sentence boundaries. Returns (left, right,
+        joiner) where joiner is the original separator that should be used
+        to recombine the translated halves — preserving alignment with the
+        source paragraph count. Both halves must be at least
+        MIN_SPLIT_CHUNK_SIZE characters. Raises ValueError if no acceptable
+        boundary is found."""
+        if len(text) < self.MIN_SPLIT_CHUNK_SIZE * 2:
+            raise ValueError(_('Text too short to split'))
+
+        midpoint = len(text) // 2
+        min_size = self.MIN_SPLIT_CHUNK_SIZE
+
+        # (regex matching the separator, joiner used when recombining)
+        # Paragraph break is preferred — splitting there preserves the
+        # original paragraph count, so do_aligment() still passes.
+        # Sentence boundary is the fallback for chunks that consist of a
+        # single long paragraph; we rejoin with a single space so we do
+        # NOT introduce a new paragraph break that would fail alignment.
+        candidates = [
+            (r'\n\n+', '\n\n'),
+            (r'(?<=[.!?])\s+', ' '),
+        ]
+        for pattern, joiner in candidates:
+            best = None
+            best_distance = None
+            for m in re.finditer(pattern, text):
+                left = text[:m.start()].rstrip()
+                right = text[m.end():].lstrip()
+                if len(left) < min_size or len(right) < min_size:
+                    continue
+                distance = abs(m.start() - midpoint)
+                if best_distance is None or distance < best_distance:
+                    best = (left, right, joiner)
+                    best_distance = distance
+            if best is not None:
+                return best
+        raise ValueError(_('No acceptable split boundary found'))
+
     def translate_paragraph(self, paragraph):
         if self.cancel_request():
             raise TranslationCanceled(_('Translation canceled.'))
@@ -160,70 +273,37 @@ class Translation:
             return
 
         text = self.glossary.replace(paragraph.original)
-        refusal_retries = getattr(
-            self.translator, 'refusal_max_retries', 0)
+        row_info = _('Row: {}').format(paragraph.row) \
+            if paragraph.row >= 0 else ''
 
-        for refusal_attempt in range(refusal_retries + 1):
-            self.streaming('')
-            self.streaming(_('Translating...'))
-            translation = self.translate_text(paragraph.row, text)
-            # Process streaming text
-            if isinstance(translation, GeneratorType):
-                if self.total == 1:
-                    # Only for a single translation.
-                    temp = ''
-                    clear = True
-                    for char in translation:
-                        # Check for cancellation during streaming
-                        if self.cancel_request():
-                            raise TranslationCanceled(
-                                _('Translation canceled.'))
-                        if clear:
-                            self.streaming('')
-                            clear = False
-                        self.streaming(char)
-                        time.sleep(0.05)
-                        temp += char
-                else:
-                    # For batch mode, still check cancellation periodically
-                    temp_chars = []
-                    for char in translation:
-                        if self.cancel_request():
-                            raise TranslationCanceled(
-                                _('Translation canceled.'))
-                        temp_chars.append(char)
-                    temp = ''.join(temp_chars)
-                translation = temp
-            translation = self.glossary.restore(translation)
-
-            # Check for content refusal (e.g., Claude refusing to translate
-            # content it identifies as copyrighted). Retry if detected.
-            if hasattr(self.translator, 'is_translation_refusal') and \
-               self.translator.is_translation_refusal(translation):
-                logged = translation[:200]
-                if len(translation) > 200:
-                    logged += '...'
-                row_info = _('Row: {}').format(paragraph.row) \
-                    if paragraph.row >= 0 else ''
-                if refusal_attempt < refusal_retries:
-                    self.log('\n'.join(filter(None, [
-                        sep(),
-                        row_info,
-                        _('Translation refusal detected, retrying ({}/{})').format(
-                            refusal_attempt + 1, refusal_retries),
-                        sep('┈'),
-                        _('Response: {}').format(logged),
-                    ])), True)
-                    time.sleep(2)
-                    continue
-                # All retries exhausted — fail instead of saving refusal text
-                raise TranslationFailed(
-                    _('Translation refused after {} retries. '
-                      '{} Response: {}').format(
-                        refusal_retries,
-                        row_info + '.' if row_info else '',
-                        logged))
-            break
+        try:
+            translation = self._translate_chunk_with_refusal_retries(
+                paragraph.row, text)
+        except RefusalExhausted as full_failure:
+            # Try a single split: translate first half (Xa), then second
+            # half (Xb) using the same retry logic. Atomic — both must
+            # succeed or the whole paragraph fails.
+            try:
+                xa, xb, joiner = self._split_text_for_retry(text)
+            except ValueError as split_err:
+                self.log('\n'.join(filter(None, [
+                    sep(),
+                    row_info,
+                    _('Cannot split chunk for retry: {}')
+                    .format(str(split_err)),
+                ])), True)
+                raise full_failure
+            self.log('\n'.join(filter(None, [
+                sep(),
+                row_info,
+                _('Splitting chunk and retrying each half '
+                  '({} + {} chars)').format(len(xa), len(xb)),
+            ])), True)
+            ta = self._translate_chunk_with_refusal_retries(
+                paragraph.row, xa, label=_('first half'))
+            tb = self._translate_chunk_with_refusal_retries(
+                paragraph.row, xb, label=_('second half'))
+            translation = ta.rstrip() + joiner + tb.lstrip()
 
         paragraph.translation = translation.strip()
         # Apply aligment checking and processing.

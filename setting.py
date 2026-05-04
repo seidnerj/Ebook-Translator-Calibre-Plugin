@@ -264,6 +264,14 @@ class TranslationSetting(QDialog):
         self.merge_token_estimate.setVisible(False)
         merge_layout.addWidget(self.merge_token_estimate)
 
+        # Third row: Refusal risk warning (Claude only, when merge_length is high)
+        self.merge_length_warning = QLabel()
+        self.merge_length_warning.setVisible(False)
+        self.merge_length_warning.setStyleSheet(
+            'color: #cc6600; font-style: italic;')
+        self.merge_length_warning.setWordWrap(True)
+        merge_layout.addWidget(self.merge_length_warning)
+
         layout.addWidget(merge_group)
 
         self.disable_wheel_event(self.merge_length)
@@ -1645,9 +1653,23 @@ class TranslationSetting(QDialog):
         """Update token estimate for Claude merge translation feature."""
         if not issubclass(self.current_engine, ClaudeTranslate):
             self.merge_token_estimate.setVisible(False)
+            self.merge_length_warning.setVisible(False)
             return
 
         chars = self.merge_length.value()
+
+        # Warn about refusal risk for large chunks (Claude can identify
+        # copyrighted books from larger excerpts and refuse to translate).
+        refusal_warning_threshold = 4000
+        if chars >= refusal_warning_threshold:
+            self.merge_length_warning.setText(_(
+                '⚠ Chunks above ~{} characters increase the risk of '
+                'copyright-related translation refusals. Consider lowering '
+                'this value if you encounter frequent refusals.'
+            ).format(refusal_warning_threshold))
+            self.merge_length_warning.setVisible(True)
+        else:
+            self.merge_length_warning.setVisible(False)
 
         # Get current source language from widget (not config, for real-time updates)
         source_lang_name = self.source_lang.currentText()

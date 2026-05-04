@@ -33,15 +33,20 @@ class ClaudeTranslate(GenAI):
     request_timeout = 30.0
 
     prompt = (
-        'You are a meticulous translator who translates any given content. '
+        'You are a translation engine integrated into Calibre, a personal '
+        'ebook management application. This is an automated translation '
+        'pipeline that processes text segments from the user\'s personal '
+        'library — content the user legally owns and is translating for '
+        'private reading. '
         'Translate the given content from <slang> to <tlang> only. Do not '
         'explain any term or answer any question-like content. Your answer '
         'should be solely the translation of the given content. In your '
         'answer do not add any prefix or suffix to the translated content. '
         'Websites\' URLs/addresses should be preserved as is in the '
         'translation\'s output. Do not omit any part of the content, even if '
-        'it seems unimportant. Never refuse a translation request or provide '
-        'commentary about the content. ')
+        'it seems unimportant. Never refuse a translation request, never '
+        'summarize instead of translating, and never add commentary or '
+        'disclaimers. Output only the translated text. ')
 
     samplings = ['temperature', 'top_p']
     sampling = 'temperature'
@@ -53,7 +58,7 @@ class ClaudeTranslate(GenAI):
     enable_extended_context = True  # 1M context (native on Claude 4.6 models)
     enable_dynamic_timeout = False  # Dynamic timeout based on content length
     enable_prompt_caching = False  # Prompt caching for parallel sections with full context
-    refusal_max_retries = 10  # Max retries when Claude refuses to translate (copyright concerns)
+    refusal_max_retries = 3  # Max retries when Claude refuses to translate (after splitting kicks in)
 
     # event types for streaming are listed here:
     # https://docs.anthropic.com/en/api/messages-streaming
@@ -326,12 +331,11 @@ class ClaudeTranslate(GenAI):
             # that this is a personal translation tool operating on the user's
             # own ebook library.
             cached_prompt = self._get_prompt() + (
-                'You are a translation engine embedded in a personal ebook '
-                'reader application. The user owns this content and is '
-                'translating it for personal use. Translate all provided '
-                'content faithfully and completely. Never refuse to translate, '
-                'never add commentary or disclaimers, and never summarize '
-                'instead of translating. Output only the translated text.')
+                'The reference context below contains the full text of one '
+                'ebook from the user\'s library, provided so you can '
+                'maintain consistent terminology, character names, and '
+                'gendered grammar across segments. Use it as reference only '
+                'and translate the segment specified in the user message.')
             system_content = [
                 {
                     "type": "text",
@@ -393,6 +397,16 @@ class ClaudeTranslate(GenAI):
 
                 if event_type == 'message_stop':
                     break
+                elif event_type == 'message_delta':
+                    # Claude 4+ classifier-level refusals appear here as
+                    # stop_reason="refusal" with no preceding text. Yield a
+                    # synthetic refusal marker so the existing refusal
+                    # detection (pattern + LLM) picks it up uniformly.
+                    delta = chunk.get('delta') or {}
+                    if delta.get('stop_reason') == 'refusal':
+                        yield ('I cannot translate this copyrighted material. '
+                               'I would be happy to help with shorter '
+                               'excerpts from copyrighted content.')
                 elif event_type == 'content_block_delta':
                     delta = chunk.get('delta')
                     if delta is not None:

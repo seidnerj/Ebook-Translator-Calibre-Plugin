@@ -641,6 +641,58 @@ class TranslationSetting(QDialog):
         consistency_pass_enabled.setVisible(False)
         genai_layout.addRow(consistency_pass_label, consistency_pass_enabled)
 
+        # Copyright-refusal mitigation toggles (Claude only).
+        # All default-on; users can disable individually if they prefer
+        # fail-loud behavior over auto-recovery.
+        strip_identifying_label = QLabel(_('Strip Identifying Content'))
+        strip_identifying_enabled = QCheckBox(_(
+            'Strip copyright/ISBN/publisher paragraphs from cached '
+            'context'))
+        strip_identifying_enabled.setToolTip(_(
+            'When prompt caching is enabled, paragraphs that match '
+            'copyright notices, ISBN markers, "all rights reserved", '
+            '"published by", etc. are stripped from the cached '
+            'reference context (but still translated normally). This '
+            'reduces the chance the model recognizes the source as '
+            'copyrighted material.\n\n'
+            'Disable this if you want full book context to be cached '
+            '(e.g., for self-authored content or works without '
+            'copyright concerns).'))
+        strip_identifying_label.setVisible(False)
+        strip_identifying_enabled.setVisible(False)
+        genai_layout.addRow(strip_identifying_label,
+                            strip_identifying_enabled)
+
+        refusal_split_label = QLabel(_('Split on Refusal'))
+        refusal_split_enabled = QCheckBox(_(
+            'Split chunks and retry each half if refusals persist'))
+        refusal_split_enabled.setToolTip(_(
+            'After the refusal-retry count is exhausted, the chunk is '
+            'split in half (at a paragraph or sentence boundary) and '
+            'each half retried independently. Successful halves are '
+            'concatenated. Atomic — if either half also fails, the '
+            'whole correction is treated as failed.\n\n'
+            'Disable this if you prefer fail-loud behavior over a '
+            'stitched translation.'))
+        refusal_split_label.setVisible(False)
+        refusal_split_enabled.setVisible(False)
+        genai_layout.addRow(refusal_split_label,
+                            refusal_split_enabled)
+
+        bare_context_label = QLabel(_('Bare-Context Fallback'))
+        bare_context_enabled = QCheckBox(_(
+            'Last-resort retry without cached book context'))
+        bare_context_enabled.setToolTip(_(
+            'After splitting also fails, retry the chunk one more time '
+            'without the cached book reference context. The translation '
+            'may be less consistent (no broader context for character '
+            'names, etc.) but the request is more likely to succeed.\n\n'
+            'Disable this if you prefer fail-loud behavior over a '
+            'context-free translation.'))
+        bare_context_label.setVisible(False)
+        bare_context_enabled.setVisible(False)
+        genai_layout.addRow(bare_context_label, bare_context_enabled)
+
         sampling_btn_group = QButtonGroup(sampling_widget)
         sampling_btn_group.addButton(temperature, 0)
         sampling_btn_group.addButton(top_p, 1)
@@ -850,6 +902,12 @@ class TranslationSetting(QDialog):
             refusal_retries_value.setVisible(False)
             consistency_pass_label.setVisible(False)
             consistency_pass_enabled.setVisible(False)
+            strip_identifying_label.setVisible(False)
+            strip_identifying_enabled.setVisible(False)
+            refusal_split_label.setVisible(False)
+            refusal_split_enabled.setVisible(False)
+            bare_context_label.setVisible(False)
+            bare_context_enabled.setVisible(False)
 
             if issubclass(self.current_engine, ClaudeTranslate):
                 # Guidance on the model selector: different Claude models
@@ -885,6 +943,20 @@ class TranslationSetting(QDialog):
                 consistency_pass_enabled.setChecked(
                     config.get('enable_consistency_pass',
                                self.current_engine.enable_consistency_pass))
+                strip_identifying_enabled.setChecked(
+                    config.get(
+                        'enable_strip_identifying_content',
+                        self.current_engine
+                        .enable_strip_identifying_content))
+                refusal_split_enabled.setChecked(
+                    config.get(
+                        'enable_refusal_split',
+                        self.current_engine.enable_refusal_split))
+                bare_context_enabled.setChecked(
+                    config.get(
+                        'enable_bare_context_fallback',
+                        self.current_engine
+                        .enable_bare_context_fallback))
 
                 # Show options for all Claude models
                 dynamic_timeout_label.setVisible(True)
@@ -895,6 +967,12 @@ class TranslationSetting(QDialog):
                 refusal_retries_value.setVisible(True)
                 consistency_pass_label.setVisible(True)
                 consistency_pass_enabled.setVisible(True)
+                strip_identifying_label.setVisible(True)
+                strip_identifying_enabled.setVisible(True)
+                refusal_split_label.setVisible(True)
+                refusal_split_enabled.setVisible(True)
+                bare_context_label.setVisible(True)
+                bare_context_enabled.setVisible(True)
 
                 # Connect to config updates
                 try:
@@ -917,6 +995,15 @@ class TranslationSetting(QDialog):
                 consistency_pass_enabled.toggled.connect(
                     lambda checked: config.update(
                         enable_consistency_pass=checked))
+                strip_identifying_enabled.toggled.connect(
+                    lambda checked: config.update(
+                        enable_strip_identifying_content=checked))
+                refusal_split_enabled.toggled.connect(
+                    lambda checked: config.update(
+                        enable_refusal_split=checked))
+                bare_context_enabled.toggled.connect(
+                    lambda checked: config.update(
+                        enable_bare_context_fallback=checked))
                 # Update token estimate when context setting changes
                 self.extended_context_enabled.toggled.connect(
                     lambda: self.update_merge_token_estimate())

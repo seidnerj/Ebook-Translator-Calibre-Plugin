@@ -70,6 +70,11 @@ class ClaudeTranslate(GenAI):
     enable_prompt_caching = False  # Prompt caching for parallel sections with full context
     refusal_max_retries = 3  # Max retries when Claude refuses to translate (after splitting kicks in)
     enable_consistency_pass = False  # Run a Pass-2 consistency review after main translation
+    # Copyright-refusal mitigation toggles. All default-on; individually
+    # toggleable for users who prefer fail-loud over auto-recovery.
+    enable_strip_identifying_content = True   # Strip copyright/ISBN paragraphs from cached book context
+    enable_refusal_split = True               # On refusal exhaustion, split chunk and retry each half
+    enable_bare_context_fallback = True       # Final fallback: retry without cached book context
 
     # event types for streaming are listed here:
     # https://docs.anthropic.com/en/api/messages-streaming
@@ -108,6 +113,14 @@ class ClaudeTranslate(GenAI):
             'refusal_max_retries', self.refusal_max_retries)
         self.enable_consistency_pass = self.config.get(
             'enable_consistency_pass', self.enable_consistency_pass)
+        self.enable_strip_identifying_content = self.config.get(
+            'enable_strip_identifying_content',
+            self.enable_strip_identifying_content)
+        self.enable_refusal_split = self.config.get(
+            'enable_refusal_split', self.enable_refusal_split)
+        self.enable_bare_context_fallback = self.config.get(
+            'enable_bare_context_fallback',
+            self.enable_bare_context_fallback)
         self.full_book_context = None  # Set externally for prompt caching
 
     # Patterns that indicate Claude refused to translate due to copyright concerns.

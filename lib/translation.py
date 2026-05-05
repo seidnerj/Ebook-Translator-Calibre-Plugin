@@ -316,36 +316,50 @@ class Translation:
         row_info = _('Row: {}').format(paragraph.row) \
             if paragraph.row >= 0 else ''
 
-        # Three-tier fallback chain:
-        #   1. Full chunk with cached context + retries
-        #   2. Split chunk into halves, each with retries (atomic)
-        #   3. Full chunk WITHOUT cached context (bare paragraph)
+        # Three-tier fallback chain (each tier individually toggleable
+        # via translator config — defaults all on):
+        #   1. Full chunk with cached context + retries (always on)
+        #   2. Split chunk into halves, each with retries (atomic) —
+        #      gated by enable_refusal_split
+        #   3. Full chunk WITHOUT cached context (bare paragraph) —
+        #      gated by enable_bare_context_fallback
+        split_enabled = getattr(
+            self.translator, 'enable_refusal_split', True)
+        bare_context_enabled = getattr(
+            self.translator, 'enable_bare_context_fallback', True)
+
+        def _try_bare_context(failure):
+            if not bare_context_enabled:
+                raise failure
+            try:
+                return self._translate_without_cached_context(
+                    paragraph.row, text, row_info)
+            except RefusalExhausted:
+                raise failure
+
         try:
             translation = self._translate_chunk_with_refusal_retries(
                 paragraph.row, text)
         except RefusalExhausted as full_failure:
-            try:
-                translation = self._translate_with_split(
-                    paragraph.row, text, row_info)
-            except ValueError as split_err:
-                self.log('\n'.join(filter(None, [
-                    sep(),
-                    row_info,
-                    _('Cannot split chunk: {}').format(str(split_err)),
-                ])), True)
-                # Skip directly to no-context fallback
+            if not split_enabled:
+                # Skip splitting; go straight to bare-context fallback
+                # (or fail if that's also disabled).
+                translation = _try_bare_context(full_failure)
+            else:
                 try:
-                    translation = self._translate_without_cached_context(
+                    translation = self._translate_with_split(
                         paragraph.row, text, row_info)
+                except ValueError as split_err:
+                    self.log('\n'.join(filter(None, [
+                        sep(),
+                        row_info,
+                        _('Cannot split chunk: {}').format(
+                            str(split_err)),
+                    ])), True)
+                    translation = _try_bare_context(full_failure)
                 except RefusalExhausted:
-                    raise full_failure
-            except RefusalExhausted:
-                # Split halves still refused — try without cached context
-                try:
-                    translation = self._translate_without_cached_context(
-                        paragraph.row, text, row_info)
-                except RefusalExhausted:
-                    raise full_failure
+                    # Split halves still refused — last resort
+                    translation = _try_bare_context(full_failure)
 
         paragraph.translation = translation.strip()
         # Apply aligment checking and processing.
@@ -418,21 +432,38 @@ class Translation:
             char_count += len(paragraph.original)
 
         # Set up prompt caching if enabled
-        # Collect full book context for caching (Claude only)
-        if hasattr(self.translator, 'enable_prompt_caching') and self.translator.enable_prompt_caching:
-            cached_paragraphs, stripped = self._strip_identifying_content(
-                paragraphs)
+        # Collect full book context for caching (Claude only).
+        # The strip step is gated by enable_strip_identifying_content
+        # (default on) — users who want full context (no copyright
+        # concerns, or self-authored content) can disable it.
+        if (hasattr(self.translator, 'enable_prompt_caching')
+                and self.translator.enable_prompt_caching):
+            strip_enabled = getattr(
+                self.translator,
+                'enable_strip_identifying_content',
+                True)
+            if strip_enabled:
+                cached_paragraphs, stripped = (
+                    self._strip_identifying_content(paragraphs))
+            else:
+                cached_paragraphs, stripped = paragraphs, 0
             full_context = '\n\n'.join(
                 [p.original for p in cached_paragraphs])
             self.translator.full_book_context = full_context
             self.log(sep())
             self.log(_('Prompt caching enabled - using full book context'))
-            self.log(_('Context size: {} characters').format(len(full_context)))
+            self.log(_('Context size: {} characters').format(
+                len(full_context)))
             if stripped > 0:
                 self.log(_(
-                    'Stripped {} identifying paragraph(s) (copyright notice, '
-                    'ISBN, etc.) from cached context to reduce refusal risk'
+                    'Stripped {} identifying paragraph(s) (copyright '
+                    'notice, ISBN, etc.) from cached context to reduce '
+                    'refusal risk'
                 ).format(stripped))
+            elif not strip_enabled:
+                self.log(_(
+                    'Identifying-content stripping is disabled — full '
+                    'book content will be cached.'))
 
         self.log(sep())
         self.log(_('Start to translate ebook content'))

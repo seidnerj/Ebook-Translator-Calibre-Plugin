@@ -223,6 +223,20 @@ class ClaudeTranslate(GenAI):
         if self.merge_enabled:
             prompt += (' Ensure that placeholders matching the pattern '
                        '{{id_\\d+}} in the content are retained.')
+            # When merge is enabled, the input may contain multiple
+            # source paragraphs separated by double newlines (\n\n).
+            # The plugin's alignment check (Paragraph.do_aligment) flags
+            # rows where the paragraph count differs between original
+            # and translation. Telling the model explicitly to preserve
+            # the count significantly reduces alignment errors.
+            prompt += (' The input may contain multiple paragraphs '
+                       'separated by double newlines (\\n\\n). '
+                       'Preserve this structure exactly: produce the '
+                       'same number of paragraphs in your output, '
+                       'separated by double newlines, in the same '
+                       'order. Each input paragraph maps to exactly '
+                       'one output paragraph — do not merge or split '
+                       'paragraphs in the translation.')
         return prompt
 
     # Substrings that identify Anthropic's content filter HTTP 400.
@@ -473,7 +487,15 @@ class ClaudeTranslate(GenAI):
             'occurrences and assigning replacement positions. When '
             'reporting a correction, set "index" to the integer N '
             'from the corresponding paragraph\'s title (e.g., a '
-            'correction targeting paragraph_5 has index: 5).'
+            'correction targeting paragraph_5 has index: 5). '
+            'Each paragraph document may contain multiple '
+            'sub-paragraphs separated by double newlines (\\n\\n) — '
+            'when the user has enabled paragraph merging the plugin '
+            'batches multiple source paragraphs into one Paragraph '
+            'object. Count occurrences across the entire document, '
+            'NOT per sub-paragraph. Find strings can span '
+            'sub-paragraph boundaries (i.e., include \\n\\n) if '
+            'needed for disambiguation.'
         )
         if attempt == 0:
             return (

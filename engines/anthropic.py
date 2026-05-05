@@ -356,18 +356,59 @@ class ClaudeTranslate(GenAI):
             'corrections': {
                 'type': 'array',
                 'description': (
-                    'Paragraphs that need correction to match the '
-                    'canonical glossary or fix gender/term '
-                    'inconsistencies.'),
+                    'Paragraphs that need correction. Each correction '
+                    'is a list of targeted find/replace operations — '
+                    'NOT a rewritten paragraph. The original paragraph '
+                    'text is preserved everywhere except where these '
+                    'replacements apply.'),
                 'items': {
                     'type': 'object',
                     'additionalProperties': False,
                     'properties': {
-                        'index': {'type': 'integer'},
-                        'reason': {'type': 'string'},
-                        'translation': {'type': 'string'},
+                        'index': {
+                            'type': 'integer',
+                            'description': (
+                                'The index of the paragraph being '
+                                'corrected (matches the [N] prefix in '
+                                'the input).'),
+                        },
+                        'reason': {
+                            'type': 'string',
+                            'description': (
+                                'Brief explanation of what was '
+                                'inconsistent.'),
+                        },
+                        'replacements': {
+                            'type': 'array',
+                            'description': (
+                                'Find/replace pairs to apply to this '
+                                'paragraph. Each find string must be '
+                                'the EXACT text that appears in the '
+                                'paragraph. Include enough surrounding '
+                                'context if the same word appears in '
+                                'different contexts that should not '
+                                'all be replaced.'),
+                            'items': {
+                                'type': 'object',
+                                'additionalProperties': False,
+                                'properties': {
+                                    'find': {
+                                        'type': 'string',
+                                        'description': (
+                                            'Exact text in the '
+                                            'paragraph to replace.'),
+                                    },
+                                    'replace': {
+                                        'type': 'string',
+                                        'description': (
+                                            'Replacement text.'),
+                                    },
+                                },
+                                'required': ['find', 'replace'],
+                            },
+                        },
                     },
-                    'required': ['index', 'translation'],
+                    'required': ['index', 'replacements'],
                 },
             },
         },
@@ -383,6 +424,24 @@ class ClaudeTranslate(GenAI):
         (output_config.format) — the prompt focuses on the analytical
         task only.
         """
+        # Critical instruction shared across all attempts: corrections
+        # are surgical find/replace operations, NOT paragraph rewrites.
+        # The previous "full corrected paragraph" approach caused the
+        # model to truncate long merged segments — losing chapter
+        # headings, sub-paragraphs, and other content. Span-based
+        # replacements preserve the original byte-for-byte except where
+        # the find string matches.
+        replacement_instructions = (
+            ' Each correction must be specified as a list of '
+            'find/replace pairs (NOT as a rewritten paragraph). For '
+            'each pair, the "find" string MUST be the exact text that '
+            'appears in the paragraph — we will look it up and replace '
+            'it programmatically. Include enough surrounding context in '
+            'the find string if the same word appears in different '
+            'situations that should not all be replaced. NEVER return '
+            'the full corrected paragraph text — only the targeted '
+            'find/replace pairs that fix the specific inconsistencies.'
+        )
         if attempt == 0:
             return (
                 'You are reviewing a {tlang} translation of a book for '
@@ -395,6 +454,7 @@ class ClaudeTranslate(GenAI):
                 'glossary entries for items that recur multiple times. '
                 'Only include corrections for paragraphs that actually '
                 'need fixing.'
+                + replacement_instructions
             ).format(tlang=target_lang)
         # Stronger framing: explicit operator/editor context. The
         # user has already produced this translation; we are only
@@ -409,6 +469,7 @@ class ClaudeTranslate(GenAI):
             'paragraphs in the user\'s translation: character name '
             'spellings, gender forms, and recurring terminology. This '
             'editorial review is a standard quality-assurance task.'
+            + replacement_instructions
         ).format(tlang=target_lang)
 
     def consistency_review(self, items, on_progress=None,
@@ -903,7 +964,7 @@ class ClaudeTranslate(GenAI):
                     'notes': (g.get('notes') or '').strip(),
                 })
 
-        # Validate corrections
+        # Validate corrections (new shape: {index, reason, replacements})
         valid_indices = {item['index'] for item in items}
         corrections_raw = parsed.get('corrections') or []
         corrections = []
@@ -914,12 +975,30 @@ class ClaudeTranslate(GenAI):
                 idx = c.get('index')
                 if idx not in valid_indices:
                     continue
-                new_text = (c.get('translation') or '').strip()
-                if not new_text:
+                replacements_raw = c.get('replacements') or []
+                if not isinstance(replacements_raw, list):
+                    continue
+                replacements = []
+                for r in replacements_raw:
+                    if not isinstance(r, dict):
+                        continue
+                    find_str = (r.get('find') or '')
+                    replace_str = (r.get('replace') or '')
+                    if not find_str:
+                        continue
+                    # Allow empty replace_str (deletion of a phrase),
+                    # but skip no-op replacements.
+                    if find_str == replace_str:
+                        continue
+                    replacements.append({
+                        'find': find_str,
+                        'replace': replace_str,
+                    })
+                if not replacements:
                     continue
                 corrections.append({
                     'index': idx,
-                    'translation': new_text,
+                    'replacements': replacements,
                     'reason': (c.get('reason') or '').strip(),
                 })
 

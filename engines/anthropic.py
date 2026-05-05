@@ -464,18 +464,30 @@ class ClaudeTranslate(GenAI):
             'assigning numbers. NEVER return the full corrected '
             'paragraph text — only these targeted operations.'
         )
+        # Shared note about the input format.
+        input_format_note = (
+            ' The translated paragraphs are provided as separate '
+            'document content blocks, each titled "segment_N" where N '
+            'is the segment\'s 0-indexed position. Treat each segment '
+            'as an independent unit when counting occurrences and '
+            'assigning replacement positions. When reporting a '
+            'correction, set "index" to the integer N from the '
+            'corresponding segment\'s title (e.g., a correction '
+            'targeting segment_5 has index: 5).'
+        )
         if attempt == 0:
             return (
                 'You are reviewing a {tlang} translation of a book for '
                 'consistency. Identify the canonical (most common) '
                 'translation of each recurring proper noun, character '
-                'name, title, and key term. Then identify paragraphs '
+                'name, title, and key term. Then identify segments '
                 'that use a different translation than the canonical '
                 'one for any such item, or that use inconsistent '
                 'gender forms for the same character. Only include '
                 'glossary entries for items that recur multiple times. '
-                'Only include corrections for paragraphs that actually '
+                'Only include corrections for segments that actually '
                 'need fixing.'
+                + input_format_note
                 + replacement_instructions
             ).format(tlang=target_lang)
         # Stronger framing: explicit operator/editor context. The
@@ -488,9 +500,10 @@ class ClaudeTranslate(GenAI):
             'requesting an editorial consistency review of their own '
             'work — they are not asking you to translate or reproduce '
             'any source material. Identify inconsistencies between '
-            'paragraphs in the user\'s translation: character name '
+            'segments in the user\'s translation: character name '
             'spellings, gender forms, and recurring terminology. This '
             'editorial review is a standard quality-assurance task.'
+            + input_format_note
             + replacement_instructions
         ).format(tlang=target_lang)
 
@@ -527,10 +540,56 @@ class ClaudeTranslate(GenAI):
         if not items:
             return {'glossary': [], 'corrections': []}
 
-        # Build the indexed input (one numbered block per paragraph)
-        input_text = '\n\n'.join(
-            '[{}] {}'.format(item['index'], item['translation'])
-            for item in items)
+        # Build the user-message content as a list of `document`
+        # content blocks — one per paragraph segment. Each document
+        # gets:
+        #  - source.type: "content" with a single text sub-block
+        #    (custom-content variant that does NOT auto-chunk; the
+        #    block is treated as one indivisible segment)
+        #  - title: "segment_N" — the model's reference handle. When
+        #    the model returns a correction with index=N, we look up
+        #    the paragraph at our internal index N (0-indexed across
+        #    items in order, which matches the document order).
+        #
+        # Followed by a final `text` block with the lead-in
+        # instruction. The system prompt explains the analytical task;
+        # this block just anchors the user message and reminds the
+        # model how to map titles to indices.
+        #
+        # No citations.enabled: citations are mutually exclusive with
+        # Structured Outputs (output_format), and we need the JSON
+        # schema enforcement more than we need parser-validated
+        # citations.
+        content_blocks = []
+        for item in items:
+            content_blocks.append({
+                'type': 'document',
+                'source': {
+                    'type': 'content',
+                    'content': [{
+                        'type': 'text',
+                        'text': item['translation'],
+                    }],
+                },
+                'title': 'segment_{}'.format(item['index']),
+            })
+        # cache_control on the LAST document block caches everything
+        # up to and including it (every document) — biggest savings on
+        # retry within the 5-minute TTL.
+        if content_blocks:
+            content_blocks[-1]['cache_control'] = {'type': 'ephemeral'}
+        # Final lead-in text block (after the cache point — small,
+        # negligible token cost to leave it uncached)
+        content_blocks.append({
+            'type': 'text',
+            'text': (
+                'Above are {} translated paragraph segments, each '
+                'provided as a document with title "segment_N" where '
+                'N is the segment index. Review them for consistency. '
+                'For each correction, set "index" to the segment '
+                'number N from the corresponding document title.'
+            ).format(len(items)),
+        })
 
         target_lang = self.target_lang
         system_prompt = self._consistency_system_prompt(
@@ -581,15 +640,7 @@ class ClaudeTranslate(GenAI):
             },
             'messages': [{
                 'role': 'user',
-                'content': [
-                    {
-                        'type': 'text',
-                        'text': input_text,
-                        # cache_control on the user message caches the
-                        # large paragraph payload — the biggest win.
-                        'cache_control': {'type': 'ephemeral'},
-                    }
-                ],
+                'content': content_blocks,
             }],
         })
 

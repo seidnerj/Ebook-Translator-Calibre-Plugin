@@ -638,43 +638,76 @@ class Translation:
                     return None, errors
             return resolved, errors
 
-        applied = 0
-        skipped = 0
+        # Pass-wide atomicity: validate ALL corrections first WITHOUT
+        # mutating any paragraph. Only if every correction is fully
+        # resolvable (every replacement found at the expected
+        # occurrence, no overlaps) do we apply anything. If any error
+        # is detected anywhere, the entire pass is aborted — no
+        # paragraph is touched.
+        #
+        # Rationale: if the model made any verifiable error, we can't
+        # trust the correction set as a whole. Partial application
+        # would leave the user uncertain which corrections went
+        # through, especially since the cache is updated per-row via
+        # the callback. All-or-nothing eliminates that ambiguity.
+
+        # Pass 1: resolve all corrections, collect errors
+        per_correction = []  # (paragraph, correction, resolved, errors)
+        total_errors = 0
         for c in corrections:
             if self.cancel_request():
                 break
             paragraph = index_to_paragraph.get(c['index'])
             if paragraph is None:
                 continue
-            row_label = (paragraph.row if paragraph.row >= 0
-                         else c['index'])
-            old_translation = paragraph.translation
             replacements = c.get('replacements') or []
-
             resolved, errors = _resolve_replacements(
-                old_translation, replacements)
-
-            # Atomicity: if ANY replacement failed, skip the entire
-            # correction. The paragraph stays exactly as it was.
+                paragraph.translation, replacements)
+            per_correction.append((paragraph, c, resolved, errors))
             if errors or resolved is None:
-                skipped += 1
+                total_errors += len(errors) if errors else 1
+
+        if self.cancel_request():
+            return
+
+        # Pass 2: if ANY error occurred anywhere, abort the entire pass
+        if total_errors > 0:
+            self.log(sep('┈'))
+            self.log(_('Consistency pass ABORTED: {} replacement '
+                       'error(s) detected. No paragraphs were '
+                       'modified.').format(total_errors))
+            for paragraph, c, resolved, errors in per_correction:
+                if not errors:
+                    continue
+                row_label = (paragraph.row if paragraph.row >= 0
+                             else c['index'])
                 self.log(sep('┈'))
-                self.log(_('Skipped row {} (atomic — none applied): {}')
+                self.log(_('Row {} (rejected): {}')
                          .format(row_label, c.get('reason', '')))
                 for f, repl, occ, reason in errors:
                     self.log(_('  ✗ [#{}] {} → {} ({})')
                              .format(occ, f, repl, reason))
-                # Also log the replacements that WOULD have applied,
-                # so the user sees the full picture of what was rejected.
                 if resolved:
                     for start, end, repl, f, occ in resolved:
                         self.log(_('  - [#{}] {} → {} (would have '
-                                   'applied at [{}:{}], skipped due '
-                                   'to other errors)')
+                                   'applied at [{}:{}], discarded '
+                                   'due to errors elsewhere)')
                                  .format(occ, f, repl, start, end))
-                continue
+            return
 
-            # All replacements valid — build new text in one pass.
+        # Pass 3: all corrections valid — apply each one in one pass
+        applied = 0
+        for paragraph, c, resolved, errors in per_correction:
+            if self.cancel_request():
+                break
+            if not resolved:
+                # Empty replacement list is unexpected but harmless
+                continue
+            row_label = (paragraph.row if paragraph.row >= 0
+                         else c['index'])
+            old_translation = paragraph.translation
+
+            # Build new text in one pass against the original.
             parts = []
             cursor = 0
             for start, end, repl, _f, _occ in resolved:
@@ -699,13 +732,8 @@ class Translation:
             self.callback(paragraph)
 
         self.log(sep('┈'))
-        if skipped > 0:
-            self.log(_('Consistency pass: applied {} correction(s), '
-                       'skipped {} (no replacements applied).')
-                     .format(applied, skipped))
-        else:
-            self.log(_('Consistency pass: applied {} correction(s).')
-                     .format(applied))
+        self.log(_('Consistency pass: applied {} correction(s).')
+                 .format(applied))
 
 
 def get_engine_class(engine_name=None):

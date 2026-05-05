@@ -11,6 +11,7 @@ from urllib.request import (
     ProxyHandler as _ProxyHandler,
     HTTPSHandler as _HTTPSHandler,
 )
+from urllib.error import HTTPError as _UrlHTTPError
 from http.client import IncompleteRead
 
 from mechanize._response import response_seek_wrapper as Response
@@ -480,11 +481,14 @@ class ClaudeTranslate(GenAI):
                     'text': system_prompt,
                 }
             ],
-            'output_config': {
-                'format': {
-                    'type': 'json_schema',
-                    'schema': self._CONSISTENCY_OUTPUT_SCHEMA,
-                },
+            # Structured Outputs — legacy beta form (top-level
+            # output_format + beta header). The newer production form
+            # (output_config.format) returned HTTP 400 with our
+            # anthropic-version header, so we use the legacy form which
+            # is documented to still work.
+            'output_format': {
+                'type': 'json_schema',
+                'schema': self._CONSISTENCY_OUTPUT_SCHEMA,
             },
             'messages': [{
                 'role': 'user',
@@ -513,12 +517,14 @@ class ClaudeTranslate(GenAI):
                 'Content-Type': 'application/json',
                 'anthropic-version': self.api_version,
                 'x-api-key': self.api_key,
-                # Always enable prompt caching for the consistency pass
-                # regardless of the user's translation-time setting.
-                # The cache is over our own translation output (not the
-                # original copyrighted source), and the savings on
-                # retries are substantial.
-                'anthropic-beta': 'prompt-caching-2024-07-31',
+                # Two beta headers, comma-separated:
+                # - prompt-caching: 90% discount on retry input cost
+                # - structured-outputs: enables the output_format field
+                #   (legacy form — see body comment above)
+                'anthropic-beta': (
+                    'prompt-caching-2024-07-31,'
+                    'structured-outputs-2025-11-13'
+                ),
             },
             method='POST',
         )
@@ -528,22 +534,35 @@ class ClaudeTranslate(GenAI):
             ssl_ctx = ssl._create_unverified_context()
         # Build opener with proxy + SSL context if needed.
         handlers = [_HTTPSHandler(context=ssl_ctx)]
-        if self.proxy_type == 'http' and self.proxy_uri:
-            handlers.append(_ProxyHandler({
-                'http': self.proxy_uri,
-                'https': self.proxy_uri,
-            }))
-            opener = _build_opener(*handlers)
-            response = opener.open(
-                url_req,
-                timeout=max(int(self.request_timeout) * 4, 120),
-            )
-        else:
-            response = _urlopen(
-                url_req,
-                timeout=max(int(self.request_timeout) * 4, 120),
-                context=ssl_ctx,
-            )
+        try:
+            if self.proxy_type == 'http' and self.proxy_uri:
+                handlers.append(_ProxyHandler({
+                    'http': self.proxy_uri,
+                    'https': self.proxy_uri,
+                }))
+                opener = _build_opener(*handlers)
+                response = opener.open(
+                    url_req,
+                    timeout=max(int(self.request_timeout) * 4, 120),
+                )
+            else:
+                response = _urlopen(
+                    url_req,
+                    timeout=max(int(self.request_timeout) * 4, 120),
+                    context=ssl_ctx,
+                )
+        except _UrlHTTPError as e:
+            # Anthropic returns rich JSON error bodies on 4xx/5xx — read
+            # them and surface in the exception so the user can see what
+            # the API actually said (auth error, malformed request, etc.)
+            # instead of a bare "HTTP Error 400".
+            try:
+                err_body = e.read().decode('utf-8', errors='replace')
+            except Exception:
+                err_body = ''
+            raise Exception(_(
+                'HTTP {}: {}\n\nResponse body:\n{}'
+            ).format(e.code, e.reason, err_body[:2000]))
         if on_progress:
             on_progress(_('  HTTP connection established, '
                           'awaiting first event...'))

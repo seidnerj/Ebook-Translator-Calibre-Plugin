@@ -1,4 +1,5 @@
 import json
+import socket as _socket
 import time
 import ssl
 from typing import Generator
@@ -557,6 +558,27 @@ class ClaudeTranslate(GenAI):
             on_progress(_('  HTTP connection established, '
                           'awaiting first event...'))
 
+        # Set a per-read socket timeout. urllib's response.close() from
+        # another thread does NOT interrupt a blocked readline() — this
+        # is a fundamental Python sync-I/O limitation (urllib3#2868).
+        # The fix is to set a short socket timeout so readline() raises
+        # socket.timeout periodically; the reader can then check the
+        # cancel flag between attempts.
+        #
+        # Without this, the Stop button gets stuck on "Stopping..."
+        # indefinitely while the reader sits blocked waiting for bytes
+        # that may never arrive (Anthropic stream stall — see issue
+        # #842 in anthropic-sdk-typescript).
+        for attr_path in ('fp.raw._sock', 'fp._sock', '_fp._sock'):
+            obj = response
+            try:
+                for attr in attr_path.split('.'):
+                    obj = getattr(obj, attr)
+                obj.settimeout(5.0)
+                break
+            except AttributeError:
+                continue
+
         # Collect streamed text. Decouples blocking I/O from the main
         # loop using a reader thread + queue, so we can check
         # cancel_request every 100ms regardless of how long any single
@@ -594,6 +616,11 @@ class ClaudeTranslate(GenAI):
                 except IncompleteRead:
                     # Transient — keep reading. Mirrors _parse_stream.
                     continue
+                except (_socket.timeout, TimeoutError):
+                    # Per-read socket timeout fired (5s of no data).
+                    # Loop back to check reader_done — this is the
+                    # mechanism that lets us cancel a blocked readline.
+                    continue
                 except Exception as e:
                     read_queue.put((ERR, e))
                     return
@@ -608,17 +635,40 @@ class ClaudeTranslate(GenAI):
         idle_log_interval = 15.0  # log every 15s of pure silence
         last_idle_log = 0.0
 
+        # Stall detection: Anthropic's tool_use+streaming has a known bug
+        # where the response stalls mid-stream after some output, with
+        # the connection alive but no further events arriving. See
+        # anthropic-sdk-typescript#842 and claude-code#19143. After
+        # this many seconds of idle (with data already received), we
+        # abort with a clear error rather than waiting forever.
+        stall_threshold = 60.0
+        stall_detected = False
+
         try:
             while True:
                 # Cancellation check — runs every 100ms regardless of
-                # I/O state.
+                # I/O state. We don't call response.close() here because
+                # close() can hang if the reader thread is blocked in
+                # readline (urllib3#2868). Instead we set reader_done in
+                # finally and rely on the socket timeout to wake the
+                # reader. The TranslationCanceled exception propagates
+                # cleanly without needing the connection torn down.
                 if cancel_request is not None and cancel_request():
-                    try:
-                        response.close()
-                    except Exception:
-                        pass
                     from ..lib.exception import TranslationCanceled as _TC
                     raise _TC(_('Translation canceled.'))
+
+                # Stall detection: known Anthropic bug, abort cleanly.
+                if (chars_received > 0
+                        and idle_seconds_so_far >= stall_threshold
+                        and not stall_detected):
+                    stall_detected = True
+                    raise Exception(_(
+                        'Stream stalled: no data for {:.0f}s after '
+                        'receiving {} chars. This is a known Anthropic '
+                        'API issue with tool_use streaming on large '
+                        'prompts (see anthropic-sdk-typescript#842). '
+                        'Try reducing paragraph count or retrying later.'
+                    ).format(idle_seconds_so_far, chars_received))
 
                 try:
                     kind, payload = read_queue.get(timeout=0.1)
@@ -736,7 +786,21 @@ class ClaudeTranslate(GenAI):
                             evt.get('error', {}).get(
                                 'message', 'unknown')))
         finally:
+            # Signal the reader to stop; with the 5s socket timeout, it
+            # will wake from any blocked readline within 5 seconds and
+            # check the flag.
             reader_done.set()
+            # Brief join attempt so the reader's response.close() doesn't
+            # race with ours. Don't block forever — the reader is daemon.
+            try:
+                reader_thread.join(timeout=0.5)
+            except Exception:
+                pass
+            # Closing the response only AFTER setting reader_done helps
+            # avoid the close()-blocked-by-readline scenario from
+            # urllib3#2868. If reader is still in readline at this point,
+            # close() may still hang on some platforms — but we've set
+            # the daemon flag so worst case it lingers until process exit.
             try:
                 response.close()
             except Exception:

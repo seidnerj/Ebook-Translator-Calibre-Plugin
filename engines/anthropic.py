@@ -208,6 +208,22 @@ class ClaudeTranslate(GenAI):
                         'heuristic (indicators: %d)' % indicator_count)
             return True
 
+    # ── Terminology mapping (model-facing vs codebase) ────────────────
+    #   block (model-facing): one translation unit. Equals one
+    #       Paragraph object's content. Document title is "block_N".
+    #   Paragraph (codebase, lib/cache.py): the Python data model and
+    #       cache row.
+    #   source structural unit: one HTML block-level element from the
+    #       EPUB (typically <p>, but also <h1>-<h6>, <li>, etc).
+    #   real paragraph (reader's intuition): a logical unit of prose,
+    #       roughly equal to a <p> element. NOT all source structural
+    #       units are real paragraphs (a heading is a structural unit,
+    #       not a paragraph in the reader's sense).
+    #
+    # When merge is OFF: 1 block = 1 Paragraph = 1 source structural
+    # unit (which may or may not be a real paragraph).
+    # When merge is ON:  1 block = 1 Paragraph = N source structural
+    # units joined by '\n\n', batched up to merge_length characters.
     def _get_prompt(self):
         prompt = self.prompt.replace('<tlang>', self.target_lang)
         if self._is_auto_lang():
@@ -484,37 +500,37 @@ class ClaudeTranslate(GenAI):
             'assigning numbers. NEVER return the full corrected '
             'paragraph text — only these targeted operations.'
         )
-        # Shared note about the input format.
+        # Shared note about input format and terminology.
         input_format_note = (
-            ' The translated paragraphs are provided as separate '
-            'document content blocks, each titled "paragraph_N" where '
-            'N is the paragraph\'s 0-indexed position. Treat each '
-            'paragraph as an independent unit when counting '
-            'occurrences and assigning replacement positions. When '
-            'reporting a correction, set "index" to the integer N '
-            'from the corresponding paragraph\'s title (e.g., a '
-            'correction targeting paragraph_5 has index: 5). '
-            'Each paragraph document may contain multiple '
-            'sub-paragraphs separated by double newlines (\\n\\n) — '
-            'when the user has enabled paragraph merging the plugin '
-            'batches multiple source paragraphs into one Paragraph '
-            'object. Count occurrences across the entire document, '
-            'NOT per sub-paragraph. Find strings can span '
-            'sub-paragraph boundaries (i.e., include \\n\\n) if '
-            'needed for disambiguation.'
+            ' The translated text is provided as separate document '
+            'content blocks, each titled "block_N" where N is the '
+            'block\'s 0-indexed position. A "block" is one '
+            'translation unit — it may be a single paragraph, a '
+            'heading, a list item, or (when paragraph merging is '
+            'enabled) several such structural units concatenated '
+            'together with double newlines (\\n\\n) as separators. '
+            'Treat each block as an independent unit when counting '
+            'occurrences and assigning replacement positions. Count '
+            'occurrences across the entire block (i.e., across all '
+            'sub-units inside it), NOT per sub-unit. Find strings can '
+            'span double-newline boundaries inside a block if that '
+            'helps disambiguate. When reporting a correction, set '
+            '"index" to the integer N from the corresponding block\'s '
+            'title (e.g., a correction targeting block_5 has '
+            'index: 5).'
         )
         if attempt == 0:
             return (
                 'You are reviewing a {tlang} translation of a book for '
                 'consistency. Identify the canonical (most common) '
                 'translation of each recurring proper noun, character '
-                'name, title, and key term. Then identify paragraphs '
-                'that use a different translation than the canonical '
-                'one for any such item, or that use inconsistent '
-                'gender forms for the same character. Only include '
-                'glossary entries for items that recur multiple times. '
-                'Only include corrections for paragraphs that actually '
-                'need fixing.'
+                'name, title, and key term. Then identify blocks that '
+                'use a different translation than the canonical one '
+                'for any such item, or that use inconsistent gender '
+                'forms for the same character. Only include glossary '
+                'entries for items that recur multiple times. Only '
+                'include corrections for blocks that actually need '
+                'fixing.'
                 + input_format_note
                 + replacement_instructions
             ).format(tlang=target_lang)
@@ -528,7 +544,7 @@ class ClaudeTranslate(GenAI):
             'requesting an editorial consistency review of their own '
             'work — they are not asking you to translate or reproduce '
             'any source material. Identify inconsistencies between '
-            'paragraphs in the user\'s translation: character name '
+            'blocks in the user\'s translation: character name '
             'spellings, gender forms, and recurring terminology. This '
             'editorial review is a standard quality-assurance task.'
             + input_format_note
@@ -569,26 +585,56 @@ class ClaudeTranslate(GenAI):
             return {'glossary': [], 'corrections': []}
 
         # Build the user-message content as a list of `document`
-        # content blocks — one per paragraph. (When merge_enabled is
-        # off, each is one paragraph from the source ebook. When merge
-        # is on, the plugin batches multiple source paragraphs into
-        # one Paragraph object for efficiency, but it's still treated
-        # as a single unit by the cache and table — and we treat it
-        # as one unit here too.)
+        # content blocks — one per Paragraph object.
+        #
+        # ── Terminology (used consistently in the model-facing
+        # ── prompt and document titles, distinct from the codebase's
+        # ── internal class names) ─────────────────────────────────────
+        #
+        #   block (model-facing):
+        #       One unit of translation passed to the model. Equals
+        #       one Paragraph object's content. Document title is
+        #       "block_N" where N is the 0-indexed position.
+        #
+        #   Paragraph (codebase class — lib/cache.py):
+        #       The Python data model. One row in the advanced
+        #       translation table. Stored in the SQLite cache.
+        #
+        #   source structural unit:
+        #       One HTML block-level element from the EPUB (typically
+        #       <p>, but also <h1>-<h6>, <li>, <blockquote>, <td>,
+        #       etc). Each carries one chunk of text.
+        #
+        #   real paragraph (reader's intuition):
+        #       A logical unit of prose. Roughly equals a <p>
+        #       element, but NOT all source structural units are real
+        #       paragraphs — a heading is a structural unit, not a
+        #       paragraph in the reader's sense.
+        #
+        # ── Relationships ─────────────────────────────────────────────
+        #
+        #   merge OFF: 1 block = 1 Paragraph = 1 source structural unit
+        #              (which may or may not be a real paragraph)
+        #
+        #   merge ON:  1 block = 1 Paragraph = N source structural
+        #              units concatenated with '\n\n', batched up to
+        #              merge_length characters. Internally a block
+        #              may contain a chapter heading, a list item,
+        #              and several real paragraphs all glued together
+        #              with '\n\n' separators.
         #
         # Each document gets:
         #  - source.type: "content" with a single text sub-block
         #    (custom-content variant that does NOT auto-chunk; the
         #    block is treated as one indivisible unit)
-        #  - title: "paragraph_N" — the model's reference handle. When
+        #  - title: "block_N" — the model's reference handle. When
         #    the model returns a correction with index=N, we look up
-        #    the paragraph at our internal index N (0-indexed across
+        #    the Paragraph at our internal index N (0-indexed across
         #    items in order, which matches the document order).
         #
         # Followed by a final `text` block with the lead-in
-        # instruction. The system prompt explains the analytical task;
-        # this block just anchors the user message and reminds the
-        # model how to map titles to indices.
+        # instruction. The system prompt explains the analytical task
+        # and the terminology; this block anchors the user message.
         #
         # No citations.enabled: citations are mutually exclusive with
         # Structured Outputs (output_format), and we need the JSON
@@ -605,7 +651,7 @@ class ClaudeTranslate(GenAI):
                         'text': item['translation'],
                     }],
                 },
-                'title': 'paragraph_{}'.format(item['index']),
+                'title': 'block_{}'.format(item['index']),
             })
         # cache_control on the LAST document block caches everything
         # up to and including it (every document) — biggest savings on
@@ -617,11 +663,11 @@ class ClaudeTranslate(GenAI):
         content_blocks.append({
             'type': 'text',
             'text': (
-                'Above are {} translated paragraphs, each provided as '
-                'a document with title "paragraph_N" where N is the '
-                'paragraph index. Review them for consistency. For '
-                'each correction, set "index" to the paragraph number '
-                'N from the corresponding document title.'
+                'Above are {} translated blocks of text, each provided '
+                'as a document with title "block_N" where N is the '
+                '0-indexed block position. Review them for consistency. '
+                'For each correction, set "index" to the integer N '
+                'from the corresponding document title.'
             ).format(len(items)),
         })
 

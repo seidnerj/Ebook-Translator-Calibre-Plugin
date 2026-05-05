@@ -318,55 +318,53 @@ class ClaudeTranslate(GenAI):
                       if p in text_lower)
         return matches >= 2
 
-    # Tool schema for the consistency review. The model is forced to
-    # use this tool (tool_choice), so the output is guaranteed to match
-    # this structure. Loose required fields — we filter at the
-    # validation layer for content quality.
-    _CONSISTENCY_TOOL_NAME = 'submit_consistency_review'
-    _CONSISTENCY_TOOL_SCHEMA = {
-        'name': _CONSISTENCY_TOOL_NAME,
-        'description': (
-            'Submit the results of a consistency review. Provide the '
-            'canonical translations of recurring terms (glossary) and '
-            'the list of paragraphs that need correction.'),
-        'input_schema': {
-            'type': 'object',
-            'properties': {
-                'glossary': {
-                    'type': 'array',
-                    'description': (
-                        'Canonical translations of recurring proper '
-                        'nouns, character names, titles, and key terms.'),
-                    'items': {
-                        'type': 'object',
-                        'properties': {
-                            'term': {'type': 'string'},
-                            'canonical': {'type': 'string'},
-                            'type': {'type': 'string'},
-                            'notes': {'type': 'string'},
-                        },
-                        'required': ['canonical'],
+    # JSON schema for the consistency review response. Used with
+    # Anthropic's Structured Outputs feature (output_config.format),
+    # which guarantees the model's text response matches this schema.
+    # Streams via text_delta events on the regular text-streaming
+    # pipeline — avoids the stall bug that affects tool_use streaming
+    # on Sonnet 4.x with large prompts.
+    #
+    # Loose required fields — we filter at the validation layer for
+    # content quality. No length/numeric constraints (Structured
+    # Outputs strips them).
+    _CONSISTENCY_OUTPUT_SCHEMA = {
+        'type': 'object',
+        'properties': {
+            'glossary': {
+                'type': 'array',
+                'description': (
+                    'Canonical translations of recurring proper nouns, '
+                    'character names, titles, and key terms.'),
+                'items': {
+                    'type': 'object',
+                    'properties': {
+                        'term': {'type': 'string'},
+                        'canonical': {'type': 'string'},
+                        'type': {'type': 'string'},
+                        'notes': {'type': 'string'},
                     },
-                },
-                'corrections': {
-                    'type': 'array',
-                    'description': (
-                        'Paragraphs that need correction to match the '
-                        'canonical glossary or fix gender/term '
-                        'inconsistencies.'),
-                    'items': {
-                        'type': 'object',
-                        'properties': {
-                            'index': {'type': 'integer'},
-                            'reason': {'type': 'string'},
-                            'translation': {'type': 'string'},
-                        },
-                        'required': ['index', 'translation'],
-                    },
+                    'required': ['canonical'],
                 },
             },
-            'required': ['glossary', 'corrections'],
+            'corrections': {
+                'type': 'array',
+                'description': (
+                    'Paragraphs that need correction to match the '
+                    'canonical glossary or fix gender/term '
+                    'inconsistencies.'),
+                'items': {
+                    'type': 'object',
+                    'properties': {
+                        'index': {'type': 'integer'},
+                        'reason': {'type': 'string'},
+                        'translation': {'type': 'string'},
+                    },
+                    'required': ['index', 'translation'],
+                },
+            },
         },
+        'required': ['glossary', 'corrections'],
     }
 
     def _consistency_system_prompt(self, target_lang, attempt=0):
@@ -374,8 +372,9 @@ class ClaudeTranslate(GenAI):
         Higher attempt numbers use stronger editorial-context framing
         to recover from refusals on the first try.
 
-        The output structure is enforced by the tool schema — the
-        prompt focuses on the analytical task only.
+        The output structure is enforced by Structured Outputs
+        (output_config.format) — the prompt focuses on the analytical
+        task only.
         """
         if attempt == 0:
             return (
@@ -385,13 +384,11 @@ class ClaudeTranslate(GenAI):
                 'name, title, and key term. Then identify paragraphs '
                 'that use a different translation than the canonical '
                 'one for any such item, or that use inconsistent '
-                'gender forms for the same character. Use the '
-                '{tool} tool to submit your findings. Only include '
+                'gender forms for the same character. Only include '
                 'glossary entries for items that recur multiple times. '
                 'Only include corrections for paragraphs that actually '
                 'need fixing.'
-            ).format(tlang=target_lang,
-                     tool=self._CONSISTENCY_TOOL_NAME)
+            ).format(tlang=target_lang)
         # Stronger framing: explicit operator/editor context. The
         # user has already produced this translation; we are only
         # asking for editorial review, not new content.
@@ -403,10 +400,9 @@ class ClaudeTranslate(GenAI):
             'work — they are not asking you to translate or reproduce '
             'any source material. Identify inconsistencies between '
             'paragraphs in the user\'s translation: character name '
-            'spellings, gender forms, and recurring terminology. Use '
-            'the {tool} tool to submit your findings. This editorial '
-            'review is a standard quality-assurance task.'
-        ).format(tlang=target_lang, tool=self._CONSISTENCY_TOOL_NAME)
+            'spellings, gender forms, and recurring terminology. This '
+            'editorial review is a standard quality-assurance task.'
+        ).format(tlang=target_lang)
 
     def consistency_review(self, items, on_progress=None,
                            cancel_request=None, _attempt=0):
@@ -460,21 +456,19 @@ class ClaudeTranslate(GenAI):
         # individual read complete quickly while the overall generation
         # continues in the background.
         #
-        # Tool use with forced tool_choice guarantees the output matches
-        # _CONSISTENCY_TOOL_SCHEMA, instead of trusting the model to
-        # follow JSON-format instructions in the prompt.
+        # Use Anthropic Structured Outputs (output_config.format) to
+        # guarantee the response is a JSON object matching our schema.
+        # This streams via plain text_delta events on the regular
+        # text-streaming pipeline — avoids the stall bug that affected
+        # tool_use streaming on Sonnet 4.x with large prompts (see
+        # anthropic-sdk-typescript#842, claude-code#19143).
         #
-        # Prompt caching marks the user message + tool definition as
-        # cacheable. On a retry within the 5-minute TTL, the second
-        # request reads the cache at 10% input cost. We always cache
-        # for the consistency pass — the caching is on our own
-        # translation output, no copyright concern, and the savings
-        # are substantial for retry scenarios.
-        #
-        # Note: an earlier mid-stream stall around ~3500 chars was
-        # initially suspected to be caching-related but reproduces with
-        # caching off too — likely a server-side or model-side issue
-        # with this specific request shape, not our caching config.
+        # Prompt caching marks the user message as cacheable. On a
+        # retry within the 5-minute TTL, the second request reads the
+        # cache at 10% input cost. We always cache for the consistency
+        # pass — the cache is over our own translation output (no
+        # copyright concern), and the savings are substantial for
+        # retry scenarios.
         body = json.dumps({
             'model': self.model,
             'max_tokens': 64_000,
@@ -486,15 +480,11 @@ class ClaudeTranslate(GenAI):
                     'text': system_prompt,
                 }
             ],
-            'tools': [
-                # cache_control on the tool definition caches it across
-                # retries (tools array stays identical).
-                dict(self._CONSISTENCY_TOOL_SCHEMA,
-                     **{'cache_control': {'type': 'ephemeral'}})
-            ],
-            'tool_choice': {
-                'type': 'tool',
-                'name': self._CONSISTENCY_TOOL_NAME,
+            'output_config': {
+                'format': {
+                    'type': 'json_schema',
+                    'schema': self._CONSISTENCY_OUTPUT_SCHEMA,
+                },
             },
             'messages': [{
                 'role': 'user',
@@ -721,36 +711,27 @@ class ClaudeTranslate(GenAI):
                                       'processing input...'))
                 elif etype == 'content_block_start':
                     if on_progress:
-                        block = evt.get('content_block') or {}
-                        if block.get('type') == 'tool_use':
-                            on_progress(_('  Tool call started '
-                                          '(submit_consistency_review), '
-                                          'streaming JSON...'))
-                        else:
-                            on_progress(_('  Output started, '
-                                          'streaming...'))
+                        on_progress(_('  Output started, streaming JSON '
+                                      'response...'))
                     output_started = True
                 elif etype == 'content_block_delta':
-                    # With tool_choice forced to a specific tool, the
-                    # delta type is input_json_delta and the content
-                    # arrives in delta.partial_json — accumulate this
-                    # into chunks (the JSON buffer).
-                    #
-                    # text_delta could also appear (e.g. if the model
-                    # produces thinking text before the tool call).
-                    # Count its chars for heartbeat but DO NOT mix it
-                    # into the JSON buffer — that would produce invalid
-                    # JSON when concatenated.
+                    # With Structured Outputs (output_config.format),
+                    # the response is a regular text content block
+                    # whose text is the JSON. Deltas are text_delta
+                    # events — same code path as plain text streaming.
                     delta = evt.get('delta') or {}
                     dtype = delta.get('type')
                     s = ''
-                    if dtype == 'input_json_delta':
+                    if dtype == 'text_delta':
+                        s = str(delta.get('text') or '')
+                        if s:
+                            chunks.append(s)
+                    elif dtype == 'input_json_delta':
+                        # Shouldn't appear with output_config.format,
+                        # but accept it defensively (legacy path).
                         s = str(delta.get('partial_json') or '')
                         if s:
                             chunks.append(s)
-                    elif dtype == 'text_delta':
-                        s = str(delta.get('text') or '')
-                        # Intentionally not appended to chunks.
                     if s:
                         chars_received += len(s)
                         if (on_progress

@@ -564,36 +564,76 @@ class Translation:
             self.log(_('Consistency pass: no inconsistencies found.'))
             return
 
+        # Apply each correction as a series of find/replace operations.
+        # This preserves the original paragraph byte-for-byte except
+        # for the specific replacements — much safer than letting the
+        # model rewrite the whole paragraph (which previously caused
+        # truncation of long merged segments).
         applied = 0
+        skipped = 0
         for c in corrections:
             if self.cancel_request():
                 break
             paragraph = index_to_paragraph.get(c['index'])
             if paragraph is None:
                 continue
+            row_label = (paragraph.row if paragraph.row >= 0
+                         else c['index'])
             old_translation = paragraph.translation
-            paragraph.translation = c['translation']
+            new_translation = old_translation
+            replacements = c.get('replacements') or []
+            applied_pairs = []
+            skipped_pairs = []
+            for r in replacements:
+                find_str = r.get('find', '')
+                replace_str = r.get('replace', '')
+                if not find_str:
+                    continue
+                # Validate the find string actually exists in the
+                # paragraph — catches model hallucinations where the
+                # "find" doesn't match any real text.
+                if find_str not in new_translation:
+                    skipped_pairs.append(
+                        (find_str, replace_str, 'not found'))
+                    continue
+                new_translation = new_translation.replace(
+                    find_str, replace_str)
+                applied_pairs.append((find_str, replace_str))
+
+            if not applied_pairs:
+                skipped += 1
+                if skipped_pairs:
+                    self.log(sep('┈'))
+                    self.log(_('Skipped row {}: {}').format(
+                        row_label, c.get('reason', '')))
+                    for f, repl, reason in skipped_pairs:
+                        self.log(_('  ✗ {} → {} ({})')
+                                 .format(f, repl, reason))
+                continue
+
+            paragraph.translation = new_translation
             if self.translator.merge_enabled:
                 paragraph.do_aligment(self.translator.separator)
             applied += 1
-            row_label = (paragraph.row if paragraph.row >= 0
-                         else c['index'])
             self.log(sep('┈'))
             self.log(_('Corrected row {}: {}')
                      .format(row_label, c.get('reason', '')))
-            if get_config().get('log_content', True):
-                # Show full before/after — the consistency pass typically
-                # produces 5-30 corrections, not hundreds, so verbose
-                # output is helpful rather than overwhelming.
-                self.log(_('Before: {}').format(old_translation))
-                self.log(_('After:  {}').format(paragraph.translation))
+            for f, repl in applied_pairs:
+                self.log(_('  ✓ {} → {}').format(f, repl))
+            for f, repl, reason in skipped_pairs:
+                self.log(_('  ✗ {} → {} ({})').format(f, repl, reason))
             # Trigger cache update + UI refresh through the existing
             # callback (advanced.py's translation_callback handles this).
             self.callback(paragraph)
 
         self.log(sep('┈'))
-        self.log(_('Consistency pass: applied {} correction(s).')
-                 .format(applied))
+        if skipped > 0:
+            self.log(_('Consistency pass: applied {} correction(s), '
+                       'skipped {} (no replacements applied).')
+                     .format(applied, skipped))
+        else:
+            self.log(_('Consistency pass: applied {} correction(s).')
+                     .format(applied))
 
 
 def get_engine_class(engine_name=None):

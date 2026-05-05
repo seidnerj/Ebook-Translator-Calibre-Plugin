@@ -564,27 +564,79 @@ class Translation:
             self.log(_('Consistency pass: no inconsistencies found.'))
             return
 
-        # Apply each correction as a series of Nth-occurrence
-        # replacements. The model specifies which specific occurrence
-        # of each find string to replace (1-indexed). Replacements are
-        # sorted by occurrence DESCENDING within each correction so
-        # that earlier replacements (higher N) don't shift the
-        # positions of later ones (lower N) when applied to the same
-        # find string.
+        # Apply each correction as a set of Nth-occurrence replacements
+        # against the ORIGINAL paragraph text, computed and validated
+        # in a single pass. The model specifies a 1-indexed occurrence
+        # for each replacement (no "replace all" shortcut).
         #
-        # This preserves the original paragraph byte-for-byte except
-        # for the specific replacements — much safer than letting the
-        # model rewrite the whole paragraph.
-        def _replace_nth(text, find, replace, n):
-            """Replace the Nth (1-indexed) occurrence of `find` with
-            `replace` in `text`. Returns the new text, or None if there
-            aren't N occurrences."""
-            parts = text.split(find)
-            if len(parts) - 1 < n:
-                return None
-            return (find.join(parts[:n])
-                    + replace
-                    + find.join(parts[n:]))
+        # Atomicity: if any replacement in a correction is invalid
+        # (find missing, occurrence too high, overlapping span), the
+        # ENTIRE correction is skipped — the paragraph is never left
+        # in a partially-corrected state.
+        #
+        # Implementation: resolve every replacement to a (start, end,
+        # replace_str) triple against the original text. Sort by start
+        # position. Reject if any spans overlap. Then reconstruct the
+        # new text in one pass by walking the original. This avoids
+        # all index-shifting concerns because every position is
+        # computed before any text is modified.
+        def _resolve_replacements(text, replacements):
+            """Resolve each replacement to a (start, end, replace_str,
+            find, occurrence) tuple in the original text. Returns
+            (resolved, errors). Sorted by start position. Detects
+            overlapping spans and adds them to errors."""
+            resolved = []
+            errors = []
+            for r in replacements:
+                find_str = r.get('find', '')
+                replace_str = r.get('replace', '')
+                occurrence = r.get('occurrence', 0)
+                if not find_str:
+                    errors.append((
+                        find_str, replace_str, occurrence,
+                        'empty find string'))
+                    continue
+                if (not isinstance(occurrence, int)
+                        or occurrence < 1):
+                    errors.append((
+                        find_str, replace_str, occurrence,
+                        'invalid occurrence (must be >= 1)'))
+                    continue
+                # Locate the Nth occurrence in the original text.
+                pos = -1
+                count = 0
+                search = 0
+                while True:
+                    found = text.find(find_str, search)
+                    if found < 0:
+                        break
+                    count += 1
+                    if count == occurrence:
+                        pos = found
+                        break
+                    search = found + 1
+                if pos < 0:
+                    errors.append((
+                        find_str, replace_str, occurrence,
+                        'only {} occurrences in paragraph'.format(count)))
+                    continue
+                resolved.append((
+                    pos, pos + len(find_str), replace_str,
+                    find_str, occurrence))
+            # Sort by start position for overlap detection + rebuilding
+            resolved.sort(key=lambda x: x[0])
+            # Detect overlapping spans
+            for i in range(len(resolved) - 1):
+                if resolved[i][1] > resolved[i + 1][0]:
+                    a = resolved[i]
+                    b = resolved[i + 1]
+                    errors.append((
+                        b[3], b[2], b[4],
+                        'span [{}:{}] overlaps with prior [{}:{}] for '
+                        '"{}" #{}'.format(b[0], b[1], a[0], a[1],
+                                          a[3], a[4])))
+                    return None, errors
+            return resolved, errors
 
         applied = 0
         skipped = 0
@@ -597,58 +649,40 @@ class Translation:
             row_label = (paragraph.row if paragraph.row >= 0
                          else c['index'])
             old_translation = paragraph.translation
-            new_translation = old_translation
             replacements = c.get('replacements') or []
-            # Apply highest-occurrence first so index-shifting from
-            # earlier replacements doesn't break later ones.
-            replacements_sorted = sorted(
-                replacements,
-                key=lambda r: r.get('occurrence', 0),
-                reverse=True)
-            applied_ops = []  # (find, replace, occurrence)
-            skipped_ops = []  # (find, replace, occurrence, reason)
-            for r in replacements_sorted:
-                find_str = r.get('find', '')
-                replace_str = r.get('replace', '')
-                occurrence = r.get('occurrence', 0)
-                if not find_str:
-                    continue
-                if not isinstance(occurrence, int) or occurrence < 1:
-                    skipped_ops.append((
-                        find_str, replace_str, occurrence,
-                        'invalid occurrence (must be >= 1)'))
-                    continue
-                count = new_translation.count(find_str)
-                if count == 0:
-                    skipped_ops.append((
-                        find_str, replace_str, occurrence,
-                        'not found in paragraph'))
-                    continue
-                if occurrence > count:
-                    skipped_ops.append((
-                        find_str, replace_str, occurrence,
-                        'only {} occurrences in paragraph'.format(count)))
-                    continue
-                result = _replace_nth(
-                    new_translation, find_str, replace_str, occurrence)
-                if result is None:
-                    skipped_ops.append((
-                        find_str, replace_str, occurrence,
-                        'replace_nth returned None'))
-                    continue
-                new_translation = result
-                applied_ops.append((find_str, replace_str, occurrence))
 
-            if not applied_ops:
+            resolved, errors = _resolve_replacements(
+                old_translation, replacements)
+
+            # Atomicity: if ANY replacement failed, skip the entire
+            # correction. The paragraph stays exactly as it was.
+            if errors or resolved is None:
                 skipped += 1
-                if skipped_ops:
-                    self.log(sep('┈'))
-                    self.log(_('Skipped row {}: {}').format(
-                        row_label, c.get('reason', '')))
-                    for f, repl, occ, reason in skipped_ops:
-                        self.log(_('  ✗ [#{}] {} → {} ({})')
-                                 .format(occ, f, repl, reason))
+                self.log(sep('┈'))
+                self.log(_('Skipped row {} (atomic — none applied): {}')
+                         .format(row_label, c.get('reason', '')))
+                for f, repl, occ, reason in errors:
+                    self.log(_('  ✗ [#{}] {} → {} ({})')
+                             .format(occ, f, repl, reason))
+                # Also log the replacements that WOULD have applied,
+                # so the user sees the full picture of what was rejected.
+                if resolved:
+                    for start, end, repl, f, occ in resolved:
+                        self.log(_('  - [#{}] {} → {} (would have '
+                                   'applied at [{}:{}], skipped due '
+                                   'to other errors)')
+                                 .format(occ, f, repl, start, end))
                 continue
+
+            # All replacements valid — build new text in one pass.
+            parts = []
+            cursor = 0
+            for start, end, repl, _f, _occ in resolved:
+                parts.append(old_translation[cursor:start])
+                parts.append(repl)
+                cursor = end
+            parts.append(old_translation[cursor:])
+            new_translation = ''.join(parts)
 
             paragraph.translation = new_translation
             if self.translator.merge_enabled:
@@ -657,11 +691,9 @@ class Translation:
             self.log(sep('┈'))
             self.log(_('Corrected row {}: {}')
                      .format(row_label, c.get('reason', '')))
-            for f, repl, occ in applied_ops:
-                self.log(_('  ✓ [#{}] {} → {}').format(occ, f, repl))
-            for f, repl, occ, reason in skipped_ops:
-                self.log(_('  ✗ [#{}] {} → {} ({})')
-                         .format(occ, f, repl, reason))
+            for start, end, repl, f, occ in resolved:
+                self.log(_('  ✓ [#{}] {} → {} (at [{}:{}])')
+                         .format(occ, f, repl, start, end))
             # Trigger cache update + UI refresh through the existing
             # callback (advanced.py's translation_callback handles this).
             self.callback(paragraph)

@@ -224,19 +224,25 @@ class ClaudeTranslate(GenAI):
             prompt += (' Ensure that placeholders matching the pattern '
                        '{{id_\\d+}} in the content are retained.')
             # When merge is enabled, the input may contain multiple
-            # source paragraphs separated by double newlines (\n\n).
-            # The plugin's alignment check (Paragraph.do_aligment) flags
-            # rows where the paragraph count differs between original
-            # and translation. Telling the model explicitly to preserve
-            # the count significantly reduces alignment errors.
-            prompt += (' The input may contain multiple paragraphs '
-                       'separated by double newlines (\\n\\n). '
-                       'Preserve this structure exactly: produce the '
-                       'same number of paragraphs in your output, '
-                       'separated by double newlines, in the same '
-                       'order. Each input paragraph maps to exactly '
-                       'one output paragraph — do not merge or split '
-                       'paragraphs in the translation.')
+            # structural blocks (paragraphs, headings, list items,
+            # blockquotes, etc.) separated by double newlines (\n\n).
+            # The plugin's alignment check (Paragraph.do_aligment)
+            # flags rows where the block count differs between original
+            # and translation. The instruction below is imperative and
+            # specific — telling the model to count separators makes
+            # it an explicit operation rather than a soft goal.
+            prompt += (
+                ' The input is a sequence of text blocks separated by '
+                'double newlines (\\n\\n). These blocks may be '
+                'paragraphs, headings, list items, or other structural '
+                'units from the source — translate each as a unit. '
+                'CRITICAL: your output must preserve the EXACT same '
+                'structure. Count the number of \\n\\n separators in '
+                'the input. Your output must contain EXACTLY that many '
+                '\\n\\n separators, in the same positions, in the same '
+                'order. NEVER merge two blocks into one. NEVER split '
+                'one block into two. The output\'s block count and '
+                'separator positions must match the input exactly.')
         return prompt
 
     # Substrings that identify Anthropic's content filter HTTP 400.

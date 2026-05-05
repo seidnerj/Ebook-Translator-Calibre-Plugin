@@ -381,13 +381,16 @@ class ClaudeTranslate(GenAI):
                         'replacements': {
                             'type': 'array',
                             'description': (
-                                'Find/replace pairs to apply to this '
-                                'paragraph. Each find string must be '
-                                'the EXACT text that appears in the '
-                                'paragraph. Include enough surrounding '
-                                'context if the same word appears in '
-                                'different contexts that should not '
-                                'all be replaced.'),
+                                'Find/replace operations to apply to '
+                                'this paragraph. Each operation '
+                                'targets ONE specific occurrence of a '
+                                'find string (1-indexed). To replace '
+                                'multiple occurrences in the same '
+                                'paragraph, enumerate each as a '
+                                'separate entry (e.g., occurrence 1, '
+                                '2, 3 if the same wrong term appears '
+                                '3 times and should be normalized '
+                                'everywhere).'),
                             'items': {
                                 'type': 'object',
                                 'additionalProperties': False,
@@ -403,8 +406,22 @@ class ClaudeTranslate(GenAI):
                                         'description': (
                                             'Replacement text.'),
                                     },
+                                    'occurrence': {
+                                        'type': 'integer',
+                                        'description': (
+                                            'Which occurrence to '
+                                            'replace, 1-indexed. MUST '
+                                            'be a positive integer '
+                                            '(>= 1). 0 is invalid and '
+                                            'will be rejected. Count '
+                                            'occurrences in the '
+                                            'original paragraph text '
+                                            'before assigning numbers.'
+                                        ),
+                                    },
                                 },
-                                'required': ['find', 'replace'],
+                                'required': [
+                                    'find', 'replace', 'occurrence'],
                             },
                         },
                     },
@@ -433,14 +450,19 @@ class ClaudeTranslate(GenAI):
         # the find string matches.
         replacement_instructions = (
             ' Each correction must be specified as a list of '
-            'find/replace pairs (NOT as a rewritten paragraph). For '
-            'each pair, the "find" string MUST be the exact text that '
-            'appears in the paragraph — we will look it up and replace '
-            'it programmatically. Include enough surrounding context in '
-            'the find string if the same word appears in different '
-            'situations that should not all be replaced. NEVER return '
-            'the full corrected paragraph text — only the targeted '
-            'find/replace pairs that fix the specific inconsistencies.'
+            'find/replace operations (NOT a rewritten paragraph). '
+            'Each operation targets ONE specific occurrence by 1-indexed '
+            'position (occurrence: 1, 2, 3, ...). Each operation has: '
+            '"find" — the EXACT text that appears in the paragraph; '
+            '"replace" — the substitute text; "occurrence" — which '
+            'instance (1-indexed, MUST be >= 1, never 0). '
+            'To replace multiple occurrences of the same wrong term '
+            '(e.g. when a character name is misspelled in 3 places), '
+            'enumerate each as a SEPARATE entry: one with occurrence:1, '
+            'one with occurrence:2, one with occurrence:3. Count the '
+            'occurrences in the original paragraph text before '
+            'assigning numbers. NEVER return the full corrected '
+            'paragraph text — only these targeted operations.'
         )
         if attempt == 0:
             return (
@@ -984,7 +1006,15 @@ class ClaudeTranslate(GenAI):
                         continue
                     find_str = (r.get('find') or '')
                     replace_str = (r.get('replace') or '')
+                    occurrence = r.get('occurrence')
                     if not find_str:
+                        continue
+                    # occurrence MUST be a positive integer (1-indexed).
+                    # 0 is explicitly invalid — model must enumerate
+                    # specific occurrences rather than use a "replace all"
+                    # shortcut.
+                    if (not isinstance(occurrence, int)
+                            or occurrence < 1):
                         continue
                     # Allow empty replace_str (deletion of a phrase),
                     # but skip no-op replacements.
@@ -993,6 +1023,7 @@ class ClaudeTranslate(GenAI):
                     replacements.append({
                         'find': find_str,
                         'replace': replace_str,
+                        'occurrence': occurrence,
                     })
                 if not replacements:
                     continue

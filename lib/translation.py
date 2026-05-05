@@ -564,11 +564,28 @@ class Translation:
             self.log(_('Consistency pass: no inconsistencies found.'))
             return
 
-        # Apply each correction as a series of find/replace operations.
+        # Apply each correction as a series of Nth-occurrence
+        # replacements. The model specifies which specific occurrence
+        # of each find string to replace (1-indexed). Replacements are
+        # sorted by occurrence DESCENDING within each correction so
+        # that earlier replacements (higher N) don't shift the
+        # positions of later ones (lower N) when applied to the same
+        # find string.
+        #
         # This preserves the original paragraph byte-for-byte except
         # for the specific replacements — much safer than letting the
-        # model rewrite the whole paragraph (which previously caused
-        # truncation of long merged segments).
+        # model rewrite the whole paragraph.
+        def _replace_nth(text, find, replace, n):
+            """Replace the Nth (1-indexed) occurrence of `find` with
+            `replace` in `text`. Returns the new text, or None if there
+            aren't N occurrences."""
+            parts = text.split(find)
+            if len(parts) - 1 < n:
+                return None
+            return (find.join(parts[:n])
+                    + replace
+                    + find.join(parts[n:]))
+
         applied = 0
         skipped = 0
         for c in corrections:
@@ -582,33 +599,55 @@ class Translation:
             old_translation = paragraph.translation
             new_translation = old_translation
             replacements = c.get('replacements') or []
-            applied_pairs = []
-            skipped_pairs = []
-            for r in replacements:
+            # Apply highest-occurrence first so index-shifting from
+            # earlier replacements doesn't break later ones.
+            replacements_sorted = sorted(
+                replacements,
+                key=lambda r: r.get('occurrence', 0),
+                reverse=True)
+            applied_ops = []  # (find, replace, occurrence)
+            skipped_ops = []  # (find, replace, occurrence, reason)
+            for r in replacements_sorted:
                 find_str = r.get('find', '')
                 replace_str = r.get('replace', '')
+                occurrence = r.get('occurrence', 0)
                 if not find_str:
                     continue
-                # Validate the find string actually exists in the
-                # paragraph — catches model hallucinations where the
-                # "find" doesn't match any real text.
-                if find_str not in new_translation:
-                    skipped_pairs.append(
-                        (find_str, replace_str, 'not found'))
+                if not isinstance(occurrence, int) or occurrence < 1:
+                    skipped_ops.append((
+                        find_str, replace_str, occurrence,
+                        'invalid occurrence (must be >= 1)'))
                     continue
-                new_translation = new_translation.replace(
-                    find_str, replace_str)
-                applied_pairs.append((find_str, replace_str))
+                count = new_translation.count(find_str)
+                if count == 0:
+                    skipped_ops.append((
+                        find_str, replace_str, occurrence,
+                        'not found in paragraph'))
+                    continue
+                if occurrence > count:
+                    skipped_ops.append((
+                        find_str, replace_str, occurrence,
+                        'only {} occurrences in paragraph'.format(count)))
+                    continue
+                result = _replace_nth(
+                    new_translation, find_str, replace_str, occurrence)
+                if result is None:
+                    skipped_ops.append((
+                        find_str, replace_str, occurrence,
+                        'replace_nth returned None'))
+                    continue
+                new_translation = result
+                applied_ops.append((find_str, replace_str, occurrence))
 
-            if not applied_pairs:
+            if not applied_ops:
                 skipped += 1
-                if skipped_pairs:
+                if skipped_ops:
                     self.log(sep('┈'))
                     self.log(_('Skipped row {}: {}').format(
                         row_label, c.get('reason', '')))
-                    for f, repl, reason in skipped_pairs:
-                        self.log(_('  ✗ {} → {} ({})')
-                                 .format(f, repl, reason))
+                    for f, repl, occ, reason in skipped_ops:
+                        self.log(_('  ✗ [#{}] {} → {} ({})')
+                                 .format(occ, f, repl, reason))
                 continue
 
             paragraph.translation = new_translation
@@ -618,10 +657,11 @@ class Translation:
             self.log(sep('┈'))
             self.log(_('Corrected row {}: {}')
                      .format(row_label, c.get('reason', '')))
-            for f, repl in applied_pairs:
-                self.log(_('  ✓ {} → {}').format(f, repl))
-            for f, repl, reason in skipped_pairs:
-                self.log(_('  ✗ {} → {} ({})').format(f, repl, reason))
+            for f, repl, occ in applied_ops:
+                self.log(_('  ✓ [#{}] {} → {}').format(occ, f, repl))
+            for f, repl, occ, reason in skipped_ops:
+                self.log(_('  ✗ [#{}] {} → {} ({})')
+                         .format(occ, f, repl, reason))
             # Trigger cache update + UI refresh through the existing
             # callback (advanced.py's translation_callback handles this).
             self.callback(paragraph)

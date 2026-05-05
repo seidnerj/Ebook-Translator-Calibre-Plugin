@@ -331,6 +331,10 @@ class ClaudeTranslate(GenAI):
     # Outputs strips them).
     _CONSISTENCY_OUTPUT_SCHEMA = {
         'type': 'object',
+        # Anthropic's Structured Outputs require additionalProperties:false
+        # on every object type — closed schemas guarantee no extra
+        # fields appear in the output.
+        'additionalProperties': False,
         'properties': {
             'glossary': {
                 'type': 'array',
@@ -339,6 +343,7 @@ class ClaudeTranslate(GenAI):
                     'character names, titles, and key terms.'),
                 'items': {
                     'type': 'object',
+                    'additionalProperties': False,
                     'properties': {
                         'term': {'type': 'string'},
                         'canonical': {'type': 'string'},
@@ -356,6 +361,7 @@ class ClaudeTranslate(GenAI):
                     'inconsistencies.'),
                 'items': {
                     'type': 'object',
+                    'additionalProperties': False,
                     'properties': {
                         'index': {'type': 'integer'},
                         'reason': {'type': 'string'},
@@ -606,6 +612,13 @@ class ClaudeTranslate(GenAI):
         next_progress_at = progress_step
         ping_count = 0
         output_started = False
+        # message_delta carries stop_reason; we save it for the
+        # post-stream check. With Structured Outputs, the relevant
+        # values are:
+        #   - "end_turn": normal completion, JSON should be parseable
+        #   - "max_tokens": output truncated mid-JSON — invalid output
+        #   - "refusal": model declined — output is refusal text, not JSON
+        final_stop_reason = None
 
         # Reader thread feeds raw lines into a queue. Daemonized so it
         # can't block process exit.
@@ -768,9 +781,12 @@ class ClaudeTranslate(GenAI):
                         on_progress(_('  ...keepalive ping #{} received')
                                     .format(ping_count))
                 elif etype == 'message_delta':
-                    # Carries usage info including prompt cache stats.
-                    # Surface them so the user can see whether caching
-                    # is reducing input cost on retry runs.
+                    # Carries stop_reason and usage info (including
+                    # prompt cache stats).
+                    delta = evt.get('delta') or {}
+                    sr = delta.get('stop_reason')
+                    if sr:
+                        final_stop_reason = sr
                     usage = evt.get('usage') or {}
                     cache_read = usage.get('cache_read_input_tokens')
                     cache_write = usage.get('cache_creation_input_tokens')
@@ -808,8 +824,26 @@ class ClaudeTranslate(GenAI):
 
         raw_text = ''.join(chunks).strip()
         if on_progress:
-            on_progress(_('  ...complete: {} characters total')
-                        .format(chars_received))
+            on_progress(_('  ...complete: {} characters total '
+                          '(stop_reason: {})')
+                        .format(chars_received,
+                                final_stop_reason or 'unknown'))
+
+        # Stop_reason handling for Structured Outputs:
+        # - 'end_turn': normal completion, JSON should parse
+        # - 'max_tokens': output truncated mid-JSON; can't recover by
+        #   parsing — must retry with higher max_tokens or smaller input
+        # - 'refusal': model declined; output is refusal text, not JSON.
+        #   Fall through to existing refusal-detection retry path.
+        # - 'stop_sequence', 'pause_turn', 'tool_use': unexpected here
+        if final_stop_reason == 'max_tokens':
+            raise Exception(_(
+                'Consistency review output was truncated (hit max_tokens '
+                'limit at {} characters). The JSON is incomplete and '
+                'cannot be parsed. Try splitting the book into smaller '
+                'sections or running consistency pass on fewer paragraphs '
+                'at a time.'
+            ).format(chars_received))
 
         # Try direct JSON parse; fall back to extracting an object from
         # surrounding text (some models add commentary despite instructions).

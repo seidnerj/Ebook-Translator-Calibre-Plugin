@@ -651,6 +651,36 @@ class TranslationSetting(QDialog):
         consistency_pass_enabled.setVisible(False)
         genai_layout.addRow(consistency_pass_label, consistency_pass_enabled)
 
+        # Translation Brief (Claude only). Auto-builds a structured
+        # reference document (canonical names, character profiles
+        # with grammatical gender, recurring terminology, style
+        # decisions) before drafting and injects it into every
+        # per-paragraph translation call. Default on.
+        translation_brief_label = QLabel(_('Translation Brief'))
+        translation_brief_enabled = QCheckBox(_(
+            'Auto-build a Translation Brief before drafting and '
+            'use it during per-paragraph translation'))
+        translation_brief_enabled.setToolTip(_(
+            'When checked, the first translation in each book '
+            'auto-builds a Translation Brief — a structured '
+            'reference document containing canonical names, '
+            'character profiles (with grammatical gender for '
+            'verb/adjective agreement), recurring terminology, '
+            'and style decisions. The brief is cached per-book '
+            'and reused for every subsequent paragraph '
+            'translation, keeping names and gender consistent '
+            'across the whole book.\n\n'
+            'You can also build / rebuild the brief manually from '
+            'the advanced translation window via the "Build '
+            'Brief" button.\n\n'
+            'Disabling this skips the brief entirely — '
+            'translation falls back to the legacy per-paragraph '
+            'flow with full-book context only.'))
+        translation_brief_label.setVisible(False)
+        translation_brief_enabled.setVisible(False)
+        genai_layout.addRow(
+            translation_brief_label, translation_brief_enabled)
+
         # Copyright-refusal mitigation toggles (Claude only).
         # All default-on; users can disable individually if they prefer
         # fail-loud behavior over auto-recovery.
@@ -912,6 +942,8 @@ class TranslationSetting(QDialog):
             refusal_retries_value.setVisible(False)
             consistency_pass_label.setVisible(False)
             consistency_pass_enabled.setVisible(False)
+            translation_brief_label.setVisible(False)
+            translation_brief_enabled.setVisible(False)
             strip_identifying_label.setVisible(False)
             strip_identifying_enabled.setVisible(False)
             refusal_split_label.setVisible(False)
@@ -953,6 +985,10 @@ class TranslationSetting(QDialog):
                 consistency_pass_enabled.setChecked(
                     config.get('enable_consistency_pass',
                                self.current_engine.enable_consistency_pass))
+                translation_brief_enabled.setChecked(
+                    config.get(
+                        'enable_translation_brief',
+                        self.current_engine.enable_translation_brief))
                 strip_identifying_enabled.setChecked(
                     config.get(
                         'enable_strip_identifying_content',
@@ -977,6 +1013,8 @@ class TranslationSetting(QDialog):
                 refusal_retries_value.setVisible(True)
                 consistency_pass_label.setVisible(True)
                 consistency_pass_enabled.setVisible(True)
+                translation_brief_label.setVisible(True)
+                translation_brief_enabled.setVisible(True)
                 strip_identifying_label.setVisible(True)
                 strip_identifying_enabled.setVisible(True)
                 refusal_split_label.setVisible(True)
@@ -1005,6 +1043,9 @@ class TranslationSetting(QDialog):
                 consistency_pass_enabled.toggled.connect(
                     lambda checked: config.update(
                         enable_consistency_pass=checked))
+                translation_brief_enabled.toggled.connect(
+                    lambda checked: config.update(
+                        enable_translation_brief=checked))
                 strip_identifying_enabled.toggled.connect(
                     lambda checked: config.update(
                         enable_strip_identifying_content=checked))

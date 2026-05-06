@@ -178,6 +178,17 @@ class TranslationWorker(QObject):
         self.on_working = False
         self.canceled = False
         self.need_close = False
+        # The Translation Brief (a dict) is held here in-memory after
+        # build, and also persisted to cache via `translation_brief`
+        # info key. Drafting reads it from whichever source is
+        # populated and pins it on the translator via
+        # `translator.translation_brief = ...`.
+        self.brief = None
+        # Cache reference, set externally by the dialog after the
+        # cache is constructed. Used by the auto-trigger to fetch
+        # all paragraphs for brief building, and to persist a
+        # newly-built brief.
+        self.cache = None
         self.translate.connect(self.translate_paragraphs)
         self.consistency.connect(self.run_consistency_pass)
         # self.finished.connect(lambda: self.set_canceled(False))
@@ -200,6 +211,70 @@ class TranslationWorker(QObject):
     def set_need_close(self, need_close):
         self.need_close = need_close
 
+    def _auto_build_brief(self, translator, log):
+        """Auto-build a Translation Brief from all source paragraphs
+        in the cache, before per-paragraph translation begins. This
+        runs the full three-turn pipeline (build → language review →
+        logic review) — same flow as the manual 'Build Brief' button,
+        but with quieter logging suitable for an in-line preparation
+        step.
+
+        Returns the brief dict on success, or None if the build
+        failed for any reason. The caller persists the brief to
+        cache via `cache.set_info('translation_brief', ...)`.
+        """
+        from .lib.translation import Translation as _Translation
+        all_paragraphs = self.cache.all_paragraphs()
+        if not all_paragraphs:
+            return None
+        log('═' * 50)
+        log(_('Auto-building Translation Brief before drafting...'))
+        log(_('(First translation in this book — building a '
+              'reference document with canonical names, character '
+              'profiles with gender, and recurring terminology so '
+              'subsequent paragraph translations stay consistent. '
+              'This takes ~2-3 minutes once per book; afterwards the '
+              'brief is cached and reused on every subsequent '
+              'translate.)'))
+        patterns = _Translation._IDENTIFYING_PATTERNS
+        items = []
+        stripped = 0
+        for i, p in enumerate(all_paragraphs):
+            text = (p.original or '').strip()
+            if not text:
+                continue
+            if any(pat.search(text) for pat in patterns):
+                stripped += 1
+                continue
+            items.append({'index': i, 'text': text})
+        if not items:
+            log(_('No source paragraphs available for brief '
+                  'building.'), True)
+            return None
+        log(_('Source: {} eligible blocks (stripped {} '
+              'identifying paragraphs).').format(
+                len(items), stripped))
+        try:
+            brief = translator.build_translation_brief(
+                items,
+                on_progress=log,
+                cancel_request=self.cancel_request)
+        except Exception as e:
+            log(_('Brief build failed: {}').format(str(e)), True)
+            log(traceback_error(), True)
+            return None
+        if brief is None:
+            log(_('Brief build returned no usable result; '
+                  'proceeding without brief.'), True)
+            return None
+        # Quieter summary than the manual-button path.
+        chars = brief.get('characters') or []
+        terms = brief.get('terminology') or []
+        log(_('Brief built: {} character(s), {} term(s).').format(
+            len(chars), len(terms)))
+        log('═' * 50)
+        return brief
+
     @pyqtSlot(list, bool)
     def translate_paragraphs(self, paragraphs=[], fresh=False):
         """:fresh: retranslate all paragraphs."""
@@ -208,6 +283,47 @@ class TranslationWorker(QObject):
         translator = get_translator(self.current_engine)
         translator.set_source_lang(self.source_lang)
         translator.set_target_lang(self.target_lang)
+
+        import json as _json
+        log = lambda text, error=False: self.logging.emit(text, error)
+
+        # ── Auto-trigger Translation Brief build ──────────────────
+        # If no brief exists yet AND the engine supports brief
+        # building AND the user hasn't opted out via setting AND we
+        # have access to cached source paragraphs, build a brief
+        # before drafting starts. The brief is the difference
+        # between "translate each paragraph in isolation" and
+        # "translate with full canonical-name and gender awareness."
+        if (self.brief is None
+                and hasattr(translator, 'build_translation_brief')
+                and getattr(translator, 'enable_translation_brief',
+                            False)
+                and self.cache is not None):
+            try:
+                brief = self._auto_build_brief(translator, log)
+                if brief is not None:
+                    self.brief = brief
+                    try:
+                        self.cache.set_info(
+                            'translation_brief',
+                            _json.dumps(brief, ensure_ascii=False))
+                    except Exception:
+                        pass
+            except Exception as e:
+                log(_('Auto-brief build failed: {} — proceeding '
+                      'without brief.').format(str(e)), True)
+
+        # Pin the brief on the translator so engines that support
+        # brief-aware drafting can inject it into their per-paragraph
+        # system prompt. Strip review-pipeline metadata (the
+        # _review_*_changes keys) before injecting — those are build-
+        # time artifacts, not part of the brief's reference content.
+        if self.brief is not None:
+            brief_for_drafting = {
+                k: v for k, v in self.brief.items()
+                if not (isinstance(k, str) and k.startswith('_review_'))}
+            translator.translation_brief = brief_for_drafting
+
         translation = get_translation(translator)
         translation.set_fresh(fresh)
         translation.set_logging(
@@ -224,27 +340,176 @@ class TranslationWorker(QObject):
 
     @pyqtSlot(list)
     def run_consistency_pass(self, paragraphs=[]):
-        """Run only the Pass-2 consistency review on already-translated
-        paragraphs. Skips the regular translation flow entirely."""
+        """Phase 0 (validation spike): the 'Consistency Pass' button
+        is temporarily repurposed to trigger Translation Brief
+        construction. The brief is logged for inspection — no
+        persistence to cache yet, no apply phase. Once Phase 0
+        validates that brief construction works on real copyrighted
+        material, this slot will be replaced by separate prep /
+        terminology / agreement slots in Phase 1.
+        """
+        import json as _json
+        from .lib.translation import Translation as _Translation
         self.on_working = True
         self.start.emit()
         translator = get_translator(self.current_engine)
         translator.set_source_lang(self.source_lang)
         translator.set_target_lang(self.target_lang)
-        # Force-enable consistency pass for this invocation, even if the
-        # user toggled the setting off after pressing the button.
-        translator.enable_consistency_pass = True
-        translation = get_translation(translator)
-        translation.set_logging(
-            lambda text, error=False: self.logging.emit(text, error))
-        translation.set_streaming(self.streaming.emit)
-        translation.set_callback(self.callback.emit)
-        translation.set_cancel_request(self.cancel_request)
+        log = lambda text, error=False: self.logging.emit(text, error)
+
+        if not hasattr(translator, 'build_translation_brief'):
+            log(_('Brief building is not supported by this engine '
+                  '(currently Claude only).'), True)
+            self.on_working = False
+            self.finished.emit()
+            return
+
         try:
-            translation.consistency_pass(paragraphs)
-            # Notify subscribers (UI uses this to record the run timestamp
-            # in the cache and refresh the button tooltip).
+            # Build items from SOURCE text (not translation). The
+            # brief is a pre-translation reference document.
+            patterns = _Translation._IDENTIFYING_PATTERNS
+            items = []
+            stripped = 0
+            for i, p in enumerate(paragraphs):
+                text = (p.original or '').strip()
+                if not text:
+                    continue
+                if any(pat.search(text) for pat in patterns):
+                    stripped += 1
+                    continue
+                items.append({'index': i, 'text': text})
+
+            log('═' * 50)
+            log(_('Building Translation Brief...'))
+            log(_('Source language: {} → Target language: {}')
+                .format(self.source_lang, self.target_lang))
+            log(_('Eligible source blocks: {} (stripped {} '
+                  'identifying paragraphs)')
+                .format(len(items), stripped))
+
+            if not items:
+                log(_('No eligible source paragraphs to analyze.'),
+                    True)
+                return
+
+            brief = translator.build_translation_brief(
+                items, on_progress=log,
+                cancel_request=self.cancel_request)
+
+            log('═' * 50)
+            if brief is None:
+                log(_('Brief build returned no usable result. '
+                      'See raw response above for diagnosis.'), True)
+                return
+
+            # Surface the review change lists (if any) before the
+            # final brief dump so the user can see what each critic
+            # caught and what was applied.
+            language_changes = brief.pop(
+                '_review_language_changes', None) \
+                if isinstance(brief, dict) else None
+            logic_changes = brief.pop(
+                '_review_logic_changes', None) \
+                if isinstance(brief, dict) else None
+            # Backwards compat with earlier single-review key.
+            legacy_changes = brief.pop('_review_change_list', None) \
+                if isinstance(brief, dict) else None
+            if legacy_changes is not None and language_changes is None:
+                language_changes = legacy_changes
+
+            log(_('Refined brief (post-review). Dumping JSON to log:'))
+            log(_json.dumps(brief, ensure_ascii=False, indent=2))
+
+            def _dump_changes(label, changes):
+                if changes is None:
+                    return
+                log('─' * 50)
+                if changes:
+                    log(_('{} review found {} issue(s):').format(
+                        label, len(changes)))
+                    for issue in changes:
+                        cat = issue.get('category', '')
+                        path = issue.get('field_path', '')
+                        cur = issue.get('current', '')
+                        sug = issue.get('suggested', '')
+                        reason = issue.get('reason', '')
+                        log('  [{}] {}: {!r} → {!r} — {}'.format(
+                            cat, path, cur, sug, reason))
+                else:
+                    log(_('{} review found no issues.').format(label))
+
+            _dump_changes(_('Language'), language_changes)
+            _dump_changes(_('Logic'), logic_changes)
+
+            # Surface a quick-scan summary alongside the JSON.
+            log('─' * 50)
+            summary = brief.get('source_summary') or {}
+            themes = summary.get('themes') or []
+            central = summary.get('central_conflict', '')
+            if themes:
+                log(_('Themes: {}').format(', '.join(themes)))
+            if central:
+                log(_('Central conflict: {}').format(central))
+
+            chars = brief.get('characters') or []
+            terms = brief.get('terminology') or []
+            char_index = {c.get('id', ''): c for c in chars if c.get('id')}
+            log(_('Summary: {} character(s), {} term(s).')
+                .format(len(chars), len(terms)))
+            for c in chars:
+                cid = c.get('id', '')
+                name = c.get('canonical_name', '')
+                src = c.get('source_name', '')
+                gender = c.get('gender', '')
+                role = c.get('role', '')
+                mentions = c.get('mention_count')
+                first = c.get('first_occurrence_index')
+                meta_bits = []
+                if mentions is not None:
+                    meta_bits.append('×{}'.format(mentions))
+                if first is not None:
+                    meta_bits.append('first@block_{}'.format(first))
+                meta = ' [' + ', '.join(meta_bits) + ']' if meta_bits else ''
+                log('  • [{}] {} ({} ← {}) — {}{}'.format(
+                    cid, name, gender, src, role, meta))
+                # Show relationships using canonical names where ids
+                # resolve, ids otherwise.
+                for rel in (c.get('relationships') or []):
+                    to_id = rel.get('to_id', '')
+                    rtype = rel.get('type', '')
+                    target = char_index.get(to_id)
+                    target_label = (target.get('canonical_name', to_id)
+                                    if target else to_id)
+                    log('       ↳ {} → {}'.format(rtype, target_label))
+            for t in terms:
+                tid = t.get('id', '')
+                canon = t.get('canonical', '')
+                src = t.get('source_form', '')
+                ttype = t.get('type', '')
+                dnt = t.get('do_not_translate', False)
+                mentions = t.get('mention_count')
+                first = t.get('first_occurrence_index')
+                meta_bits = []
+                if dnt:
+                    meta_bits.append('DNT')
+                if mentions is not None:
+                    meta_bits.append('×{}'.format(mentions))
+                if first is not None:
+                    meta_bits.append('first@block_{}'.format(first))
+                meta = ' [' + ', '.join(meta_bits) + ']' if meta_bits else ''
+                log('  · [{}] {} ({}) ← {}{}'.format(
+                    tid, canon, ttype, src, meta))
+
+            # Phase 1a spike: hold the brief in-memory on the worker
+            # so subsequent translate_paragraphs calls in the same
+            # session can pin it on the translator. The dialog's
+            # consistency_completed handler will also persist it to
+            # cache so it survives plugin reloads.
+            self.brief = brief
             self.consistency_completed.emit()
+        except Exception as e:
+            log(_('Brief build failed: {}').format(str(e)), True)
+            log(traceback_error(), True)
         finally:
             self.on_working = False
             self.finished.emit()
@@ -470,6 +735,11 @@ class AdvancedTranslation(QDialog):
 
         def prepare_table_layout(cache_id):
             self.cache = get_cache(cache_id)
+            # Hand the cache to the worker so the auto-brief build
+            # path can fetch all source paragraphs and persist a
+            # newly-built brief without round-tripping through the
+            # dialog.
+            self.trans_worker.cache = self.cache
             merge_length = self.cache.get_info('merge_length') or 0
             self.merge_enabled = int(merge_length) > 0
             paragraphs = self.cache.all_paragraphs()
@@ -479,6 +749,18 @@ class AdvancedTranslation(QDialog):
                     'warning')
                 self.done(0)
                 return
+            # Phase 1a spike: rehydrate the brief from cache (if a
+            # previous session built one) so the worker has it
+            # available for translation calls without requiring the
+            # user to rebuild.
+            try:
+                import json as _json_load
+                brief_json = self.cache.get_info('translation_brief')
+                if brief_json:
+                    self.trans_worker.brief = _json_load.loads(brief_json)
+            except Exception:
+                # Corrupt JSON or missing key — proceed without brief.
+                pass
             self.table = AdvancedTranslationTable(self, paragraphs)
             self.panel = self.layout_panel()
             self.stack.addWidget(self.panel)
@@ -746,8 +1028,14 @@ class AdvancedTranslation(QDialog):
         delete_button.setToolTip(delete_button.text() + ' [Del]')
         batch_translation = QPushButton(
             ' %s (%s)' % (_('Batch Translation'), _('Beta')))
+        # Manual brief-build button (also auto-triggered on first
+        # translate when the brief is missing and the engine
+        # supports it). Kept as a manual rebuild path for when the
+        # user wants to regenerate the brief explicitly — e.g. after
+        # discovering issues in the brief or after editing source
+        # paragraphs.
         consistency_pass_button = QPushButton(
-            '  %s  ' % _('Consistency Pass'))
+            '  %s  ' % _('Build Brief'))
         translate_all = QPushButton('  %s  ' % _('Translate All'))
         translate_untranslated = QPushButton(
             '  %s  ' % _('Translate Untranslated'))
@@ -810,35 +1098,50 @@ class AdvancedTranslation(QDialog):
             consistency_pass_button.setVisible(visible)
             if not visible:
                 return
-            # Enable only if every paragraph has a translation. Iterate
-            # the table model directly to avoid the overhead of building
-            # a full Paragraph list each time.
+            # Enabled whenever source text exists — brief is built
+            # from source, translation isn't required.
             total_rows = self.table.rowCount()
-            all_translated = total_rows > 0 and all(
-                self.table.paragraph(r).translation
-                for r in range(total_rows))
-            consistency_pass_button.setEnabled(all_translated)
-            if all_translated:
+            has_source = total_rows > 0
+            consistency_pass_button.setEnabled(has_source)
+            if has_source:
                 consistency_pass_button.setToolTip(_(
-                    'Run the consistency review pass over all '
-                    'translations (Claude only).\nLast run: {}'
+                    'Build a Translation Brief — a structured '
+                    'reference document with canonical names, '
+                    'character profiles (with grammatical gender '
+                    'for verb/adjective agreement), recurring '
+                    'terminology, and style decisions. Generated '
+                    'once from the source text; cached and reused '
+                    'on every subsequent translation. Translation '
+                    'auto-builds this on first run if missing; '
+                    'click here to rebuild manually.\n\nLast run: {}'
                 ).format(_last_consistency_pass_label()))
             else:
                 consistency_pass_button.setToolTip(_(
-                    'Disabled until all paragraphs have a translation '
-                    '— the consistency pass needs the full text to '
-                    'identify inconsistencies.'))
+                    'Disabled until source paragraphs are loaded.'))
 
         # Save references the callback chain can reach.
         self.update_consistency_pass_button = update_consistency_pass_button
 
         def record_consistency_pass_time():
             """Persist the run timestamp in cache info so it survives
-            plugin reloads, and refresh the button tooltip."""
+            plugin reloads. Phase 1a spike: also persist the brief
+            itself so subsequent sessions can use it for drafting."""
             from datetime import datetime
             ts = datetime.now().strftime('%Y-%m-%d %H:%M')
             if self.cache is not None:
                 self.cache.set_info('last_consistency_pass', ts)
+                # Persist the brief so future translate runs (even
+                # after plugin reload) pick it up automatically.
+                if getattr(self.trans_worker, 'brief', None) is not None:
+                    try:
+                        import json as _json_persist
+                        self.cache.set_info(
+                            'translation_brief',
+                            _json_persist.dumps(
+                                self.trans_worker.brief,
+                                ensure_ascii=False))
+                    except Exception:
+                        pass
             update_consistency_pass_button()
         self.trans_worker.consistency_completed.connect(
             record_consistency_pass_time)
@@ -1438,22 +1741,14 @@ class AdvancedTranslation(QDialog):
         self.trans_worker.translate.emit(paragraphs, False)
 
     def run_consistency_pass(self):
-        """Run only the Pass-2 consistency review on already-translated
-        paragraphs. Re-translation is skipped — only the consistency
-        review and corrections happen."""
+        """Phase 0 spike: build a Translation Brief from source text
+        and dump it to the log. Translations are not required (and
+        not consulted) — the brief is a pre-translation reference
+        document built from the source.
+        """
         paragraphs = self.table.get_selected_paragraphs(False, True)
-        # Defensive check (button should already be disabled if any are
-        # missing translations, but cover the race where a translation
-        # callback hasn't propagated yet).
-        if any(not p.translation for p in paragraphs):
-            self.alert.pop(
-                _('Cannot run consistency pass while some paragraphs '
-                  'are still untranslated.'), 'info')
-            return
         if len(paragraphs) < 1:
             return
-        # Progress reporting expects a step value; use 1/N like the other
-        # actions so the bar moves as the consistency pass logs progress.
         self.progress_step = self.get_progress_step(len(paragraphs))
         self.trans_worker.consistency.emit(paragraphs)
 

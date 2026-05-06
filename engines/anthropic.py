@@ -86,7 +86,7 @@ class ClaudeTranslate(GenAI):
     # validates uniqueness before applying. Default off; manual
     # button trigger.
     supports_agreement_review = True
-    enable_agreement_pass = False
+    enable_agreement_pass = True
     # Copyright-refusal mitigation toggles. All default-on; individually
     # toggleable for users who prefer fail-loud over auto-recovery.
     enable_strip_identifying_content = True   # Strip copyright/ISBN paragraphs from cached book context

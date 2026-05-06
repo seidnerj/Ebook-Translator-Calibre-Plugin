@@ -700,7 +700,7 @@ class TranslationSetting(QDialog):
             'canonical character morphology in the brief and '
             'applies single-occurrence find/replace fixes. Sees '
             'only translated text — no copyrighted source material '
-            'is sent. Default off; opt-in.'))
+            'is sent. Default on; uncheck to hide the button.'))
         agreement_pass_label.setVisible(False)
         agreement_pass_enabled.setVisible(False)
         genai_layout.addRow(

@@ -681,6 +681,31 @@ class TranslationSetting(QDialog):
         genai_layout.addRow(
             translation_brief_label, translation_brief_enabled)
 
+        # Agreement Pass (Claude only). Opt-in revision pass that
+        # scans translated paragraphs for residual gender/number/
+        # pronoun drift against the canonical character morphology
+        # in the brief and emits single-occurrence find/replace
+        # fixes. The setting only controls visibility/availability;
+        # the pass itself is always manually triggered via the
+        # advanced translation window's "Run Agreement Pass" button.
+        agreement_pass_label = QLabel(_('Agreement Pass'))
+        agreement_pass_enabled = QCheckBox(_(
+            'Enable post-translation Agreement Pass (gender / '
+            'number / pronoun drift correction)'))
+        agreement_pass_enabled.setToolTip(_(
+            'When enabled, the "Run Agreement Pass" button is '
+            'available in the advanced translation window. The '
+            'pass scans translated paragraphs for residual gender '
+            '/ number / pronoun agreement drift against the '
+            'canonical character morphology in the brief and '
+            'applies single-occurrence find/replace fixes. Sees '
+            'only translated text — no copyrighted source material '
+            'is sent. Default off; opt-in.'))
+        agreement_pass_label.setVisible(False)
+        agreement_pass_enabled.setVisible(False)
+        genai_layout.addRow(
+            agreement_pass_label, agreement_pass_enabled)
+
         # Copyright-refusal mitigation toggles (Claude only).
         # All default-on; users can disable individually if they prefer
         # fail-loud behavior over auto-recovery.
@@ -944,6 +969,8 @@ class TranslationSetting(QDialog):
             consistency_pass_enabled.setVisible(False)
             translation_brief_label.setVisible(False)
             translation_brief_enabled.setVisible(False)
+            agreement_pass_label.setVisible(False)
+            agreement_pass_enabled.setVisible(False)
             strip_identifying_label.setVisible(False)
             strip_identifying_enabled.setVisible(False)
             refusal_split_label.setVisible(False)
@@ -989,6 +1016,10 @@ class TranslationSetting(QDialog):
                     config.get(
                         'enable_translation_brief',
                         self.current_engine.enable_translation_brief))
+                agreement_pass_enabled.setChecked(
+                    config.get(
+                        'enable_agreement_pass',
+                        self.current_engine.enable_agreement_pass))
                 strip_identifying_enabled.setChecked(
                     config.get(
                         'enable_strip_identifying_content',
@@ -1015,6 +1046,8 @@ class TranslationSetting(QDialog):
                 consistency_pass_enabled.setVisible(True)
                 translation_brief_label.setVisible(True)
                 translation_brief_enabled.setVisible(True)
+                agreement_pass_label.setVisible(True)
+                agreement_pass_enabled.setVisible(True)
                 strip_identifying_label.setVisible(True)
                 strip_identifying_enabled.setVisible(True)
                 refusal_split_label.setVisible(True)
@@ -1046,6 +1079,9 @@ class TranslationSetting(QDialog):
                 translation_brief_enabled.toggled.connect(
                     lambda checked: config.update(
                         enable_translation_brief=checked))
+                agreement_pass_enabled.toggled.connect(
+                    lambda checked: config.update(
+                        enable_agreement_pass=checked))
                 strip_identifying_enabled.toggled.connect(
                     lambda checked: config.update(
                         enable_strip_identifying_content=checked))

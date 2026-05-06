@@ -164,6 +164,8 @@ class TranslationWorker(QObject):
     translate = pyqtSignal(list, bool)
     consistency = pyqtSignal(list)
     consistency_completed = pyqtSignal()
+    agreement = pyqtSignal(list)
+    agreement_completed = pyqtSignal(int)
     logging = pyqtSignal(str, bool)
     # error = pyqtSignal(str, str, str)
     streaming = pyqtSignal(object)
@@ -191,6 +193,7 @@ class TranslationWorker(QObject):
         self.cache = None
         self.translate.connect(self.translate_paragraphs)
         self.consistency.connect(self.run_consistency_pass)
+        self.agreement.connect(self.run_agreement_pass)
         # self.finished.connect(lambda: self.set_canceled(False))
 
     def set_source_lang(self, lang):
@@ -509,6 +512,150 @@ class TranslationWorker(QObject):
             self.consistency_completed.emit()
         except Exception as e:
             log(_('Brief build failed: {}').format(str(e)), True)
+            log(traceback_error(), True)
+        finally:
+            self.on_working = False
+            self.finished.emit()
+
+    @pyqtSlot(list)
+    def run_agreement_pass(self, paragraphs=[]):
+        """Run an Agreement Pass over the translated paragraphs:
+        scan for residual gender/number/pronoun drift against the
+        canonical character morphology in the brief, request fixes
+        from the engine, validate single-occurrence uniqueness, and
+        apply the validated fixes back to the cache.
+
+        Requires a brief to be present (the canonical morphology
+        source). Skips silently with a log message if absent.
+        """
+        import json as _json
+        self.on_working = True
+        self.start.emit()
+        translator = get_translator(self.current_engine)
+        translator.set_source_lang(self.source_lang)
+        translator.set_target_lang(self.target_lang)
+        log = lambda text, error=False: self.logging.emit(text, error)
+
+        if not getattr(translator, 'supports_agreement_review', False) \
+                or not hasattr(translator, 'agreement_review'):
+            log(_('Agreement Pass is not supported by this engine '
+                  '(currently Claude only).'), True)
+            self.on_working = False
+            self.finished.emit()
+            return
+
+        # Rehydrate brief: prefer the in-memory copy, fall back to
+        # the persisted one in cache.
+        brief = self.brief
+        if brief is None and self.cache is not None:
+            try:
+                brief_json = self.cache.get_info('translation_brief')
+                if brief_json:
+                    brief = _json.loads(brief_json)
+            except Exception:
+                brief = None
+        if not brief:
+            log(_('Agreement Pass requires a Translation Brief. '
+                  'Click "Build Brief" first (or run a translation '
+                  'with auto-brief enabled).'), True)
+            self.on_working = False
+            self.finished.emit()
+            return
+
+        try:
+            log('═' * 50)
+            log(_('Running Agreement Pass...'))
+            log(_('Target language: {}').format(self.target_lang))
+
+            # Items use the paragraphs' indices in the supplied list
+            # — these match the block_N indices the engine emits in
+            # its fixes. Caller passes all_paragraphs() so indices
+            # are stable across the book.
+            items = []
+            for i, p in enumerate(paragraphs):
+                t = (getattr(p, 'translation', None) or '').strip()
+                if not t:
+                    continue
+                items.append({
+                    'index': i,
+                    'translation': p.translation,
+                })
+            log(_('Translated paragraphs available: {}/{}.').format(
+                len(items), len(paragraphs)))
+            if not items:
+                log(_('No translated paragraphs to review.'), True)
+                return
+
+            result = translator.agreement_review(
+                items, brief, on_progress=log,
+                cancel_request=self.cancel_request)
+            fixes = result.get('fixes') or []
+            unfixable = result.get('unfixable') or []
+            considered = result.get('considered', 0)
+
+            log('─' * 50)
+            log(_('Agreement Pass: reviewed {} paragraph(s) that '
+                  'mention named characters; {} fix(es) validated, '
+                  '{} rejected by uniqueness check.').format(
+                considered, len(fixes), len(unfixable)))
+
+            applied = 0
+            char_index = {}
+            for c in (brief.get('characters') or []):
+                if isinstance(c, dict) and c.get('id'):
+                    char_index[c['id']] = c
+            for f in fixes:
+                idx = f.get('block_index')
+                old_str = f.get('old_str') or ''
+                new_str = f.get('new_str') or ''
+                if (not isinstance(idx, int)
+                        or idx < 0 or idx >= len(paragraphs)
+                        or not old_str or old_str == new_str):
+                    continue
+                p = paragraphs[idx]
+                t = getattr(p, 'translation', None) or ''
+                # Re-verify count == 1 at apply time (engine may
+                # have validated against the same text, but be
+                # defensive).
+                if t.count(old_str) != 1:
+                    continue
+                p.translation = t.replace(old_str, new_str, 1)
+                applied += 1
+                if self.cache is not None:
+                    try:
+                        self.cache.update_paragraph(p)
+                    except Exception:
+                        pass
+                # Surface to the table so the user sees the change.
+                try:
+                    self.callback.emit(p)
+                except Exception:
+                    pass
+                cid = f.get('character_id') or ''
+                cname = (char_index.get(cid, {}).get('canonical_name')
+                         if cid else '') or cid or '—'
+                kind = f.get('kind') or 'other'
+                log('  ✓ block_{} [{}] {} — {!r} → {!r} ({})'.format(
+                    idx, kind, cname, old_str, new_str,
+                    f.get('reason') or ''))
+
+            if unfixable:
+                log('─' * 50)
+                log(_('Rejected (uniqueness failed) — surfaced for '
+                      'inspection:'))
+                for u in unfixable:
+                    log('  ✗ block_{}: {!r} → {!r} — {}'.format(
+                        u.get('block_index', '?'),
+                        u.get('old_str', ''),
+                        u.get('new_str', ''),
+                        u.get('reason', '')))
+
+            log('═' * 50)
+            log(_('Agreement Pass complete: {} fix(es) applied.')
+                .format(applied))
+            self.agreement_completed.emit(applied)
+        except Exception as e:
+            log(_('Agreement Pass failed: {}').format(str(e)), True)
             log(traceback_error(), True)
         finally:
             self.on_working = False
@@ -1036,6 +1183,12 @@ class AdvancedTranslation(QDialog):
         # paragraphs.
         consistency_pass_button = QPushButton(
             '  %s  ' % _('Build Brief'))
+        # Agreement Pass: post-translation revision pass that fixes
+        # gender/number/pronoun drift in the translated text against
+        # the brief. Visible only for Claude; disabled until both a
+        # brief exists and at least one translation is present.
+        agreement_pass_button = QPushButton(
+            '  %s  ' % _('Run Agreement Pass'))
         translate_all = QPushButton('  %s  ' % _('Translate All'))
         translate_untranslated = QPushButton(
             '  %s  ' % _('Translate Untranslated'))
@@ -1044,6 +1197,8 @@ class AdvancedTranslation(QDialog):
         delete_button.clicked.connect(self.table.delete_selected_rows)
         consistency_pass_button.clicked.connect(
             self.run_consistency_pass)
+        agreement_pass_button.clicked.connect(
+            self.run_agreement_pass)
         translate_all.clicked.connect(self.translate_all_paragraphs)
         translate_untranslated.clicked.connect(
             self.translate_untranslated_paragraphs)
@@ -1052,11 +1207,13 @@ class AdvancedTranslation(QDialog):
         # Track the button so update_consistency_pass_button() can read its
         # state.
         self.consistency_pass_button = consistency_pass_button
+        self.agreement_pass_button = agreement_pass_button
 
         action_layout.addWidget(delete_button)
         action_layout.addStretch(1)
         action_layout.addWidget(batch_translation)
         action_layout.addWidget(consistency_pass_button)
+        action_layout.addWidget(agreement_pass_button)
         action_layout.addWidget(translate_all)
         action_layout.addWidget(translate_untranslated)
         action_layout.addWidget(translate_selected)
@@ -1077,6 +1234,7 @@ class AdvancedTranslation(QDialog):
         # automatically at the end of translate_paragraphs; users can
         # always invoke it manually via this button.
         consistency_pass_button.setVisible(False)
+        agreement_pass_button.setVisible(False)
 
         def _last_consistency_pass_label():
             """Return a human-readable 'Last run: ...' string from cache,
@@ -1122,6 +1280,79 @@ class AdvancedTranslation(QDialog):
         # Save references the callback chain can reach.
         self.update_consistency_pass_button = update_consistency_pass_button
 
+        def _last_agreement_pass_label():
+            ts = None
+            if self.cache is not None:
+                ts = self.cache.get_info('last_agreement_pass')
+            if not ts:
+                return _('never')
+            return ts
+
+        def _has_brief_in_cache():
+            if self.cache is None:
+                return False
+            try:
+                return bool(self.cache.get_info('translation_brief'))
+            except Exception:
+                return False
+
+        def _has_any_translation():
+            if self.cache is None:
+                return False
+            try:
+                paras = self.cache.all_paragraphs() or []
+            except Exception:
+                return False
+            for p in paras:
+                if (getattr(p, 'translation', None) or '').strip():
+                    return True
+            return False
+
+        def update_agreement_pass_button():
+            from .engines.anthropic import ClaudeTranslate
+            engine_class = self.current_engine
+            opted_in = bool(
+                engine_class is not None
+                and engine_class.config.get(
+                    'enable_agreement_pass',
+                    getattr(engine_class,
+                            'enable_agreement_pass', False)))
+            visible = (
+                engine_class is not None
+                and issubclass(engine_class, ClaudeTranslate)
+                and getattr(engine_class,
+                            'supports_agreement_review', False)
+                and opted_in
+            )
+            agreement_pass_button.setVisible(visible)
+            if not visible:
+                return
+            has_brief = _has_brief_in_cache()
+            has_translation = _has_any_translation()
+            agreement_pass_button.setEnabled(
+                has_brief and has_translation)
+            if not has_brief:
+                agreement_pass_button.setToolTip(_(
+                    'Build a Translation Brief first — the '
+                    'Agreement Pass uses canonical character '
+                    'morphology from the brief to detect drift.'))
+            elif not has_translation:
+                agreement_pass_button.setToolTip(_(
+                    'Translate at least one paragraph first — the '
+                    'Agreement Pass reviews translated text.'))
+            else:
+                agreement_pass_button.setToolTip(_(
+                    'Scan translated paragraphs for residual '
+                    'gender / number / pronoun agreement drift '
+                    'against the canonical character morphology '
+                    'in the brief, and apply single-occurrence '
+                    'fixes. Sees only translated text — no '
+                    'copyrighted source material is sent.\n\n'
+                    'Last run: {}'
+                ).format(_last_agreement_pass_label()))
+
+        self.update_agreement_pass_button = update_agreement_pass_button
+
         def record_consistency_pass_time():
             """Persist the run timestamp in cache info so it survives
             plugin reloads. Phase 1a spike: also persist the brief
@@ -1143,14 +1374,30 @@ class AdvancedTranslation(QDialog):
                     except Exception:
                         pass
             update_consistency_pass_button()
+            # A fresh brief makes Agreement Pass eligible if a
+            # translation already exists.
+            update_agreement_pass_button()
         self.trans_worker.consistency_completed.connect(
             record_consistency_pass_time)
+
+        def record_agreement_pass_time(applied):
+            from datetime import datetime
+            ts = datetime.now().strftime('%Y-%m-%d %H:%M')
+            if self.cache is not None:
+                try:
+                    self.cache.set_info('last_agreement_pass', ts)
+                except Exception:
+                    pass
+            update_agreement_pass_button()
+        self.trans_worker.agreement_completed.connect(
+            record_agreement_pass_time)
 
         self.batch_translation.connect(
             lambda: batch_translation.setVisible(
                 self.current_engine == ChatgptTranslate))
         self.batch_translation.emit()
         update_consistency_pass_button()
+        update_agreement_pass_button()
 
         def start_batch_translation():
             translator = get_translator(self.current_engine)
@@ -1202,6 +1449,8 @@ class AdvancedTranslation(QDialog):
             # gate so it only stays enabled when appropriate.
             if hasattr(self, 'update_consistency_pass_button'):
                 self.update_consistency_pass_button()
+            if hasattr(self, 'update_agreement_pass_button'):
+                self.update_agreement_pass_button()
         self.trans_worker.finished.connect(working_finished)
 
         return stack
@@ -1545,6 +1794,8 @@ class AdvancedTranslation(QDialog):
             # "all translated" predicate.
             if hasattr(self, 'update_consistency_pass_button'):
                 self.update_consistency_pass_button()
+            if hasattr(self, 'update_agreement_pass_button'):
+                self.update_agreement_pass_button()
 
         self.trans_worker.callback.connect(translation_callback)
 
@@ -1751,6 +2002,20 @@ class AdvancedTranslation(QDialog):
             return
         self.progress_step = self.get_progress_step(len(paragraphs))
         self.trans_worker.consistency.emit(paragraphs)
+
+    def run_agreement_pass(self):
+        """Run an Agreement Pass over every paragraph in the book
+        (selection is ignored — agreement is a global revision pass
+        because canonical character morphology spans the whole work).
+        Worker filters out paragraphs that lack a translation.
+        """
+        if self.cache is None:
+            return
+        paragraphs = self.cache.all_paragraphs() or []
+        if len(paragraphs) < 1:
+            return
+        self.progress_step = self.get_progress_step(len(paragraphs))
+        self.trans_worker.agreement.emit(paragraphs)
 
     def translate_selected_paragraph(self):
         paragraphs = self.table.get_selected_paragraphs()

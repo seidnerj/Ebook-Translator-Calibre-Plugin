@@ -1,4 +1,5 @@
 import json
+import re
 import socket as _socket
 import time
 import ssl
@@ -76,6 +77,16 @@ class ClaudeTranslate(GenAI):
     # gender, and recurring terminology stay consistent. Default on
     # for Claude. User can disable to skip the brief build.
     enable_translation_brief = True
+    # Agreement Pass: opt-in revision pass that scans translated
+    # paragraphs for residual gender/number drift against the
+    # canonical character morphology in the brief and emits single-
+    # occurrence find/replace fixes. Distinct from drafting: runs
+    # AFTER translation is complete, sees only translated text +
+    # brief (no source-language copyright concern), and the host
+    # validates uniqueness before applying. Default off; manual
+    # button trigger.
+    supports_agreement_review = True
+    enable_agreement_pass = False
     # Copyright-refusal mitigation toggles. All default-on; individually
     # toggleable for users who prefer fail-loud over auto-recovery.
     enable_strip_identifying_content = True   # Strip copyright/ISBN paragraphs from cached book context
@@ -121,6 +132,8 @@ class ClaudeTranslate(GenAI):
             'enable_consistency_pass', self.enable_consistency_pass)
         self.enable_translation_brief = self.config.get(
             'enable_translation_brief', self.enable_translation_brief)
+        self.enable_agreement_pass = self.config.get(
+            'enable_agreement_pass', self.enable_agreement_pass)
         self.enable_strip_identifying_content = self.config.get(
             'enable_strip_identifying_content',
             self.enable_strip_identifying_content)
@@ -944,6 +957,96 @@ class ClaudeTranslate(GenAI):
         'required': ['glossary'],
     }
 
+    # Agreement Pass output schema. The model emits a list of single-
+    # occurrence find/replace fixes that correct residual gender /
+    # number / pronoun drift in the translation against the canonical
+    # character morphology supplied in the brief. The host validates
+    # uniqueness (old_str must appear EXACTLY ONCE in its target
+    # block) before applying — same uniqueness contract used by the
+    # consistency repair loop. Failures are repaired in a second
+    # round via _build_repair_message / _validate_corrections.
+    _AGREEMENT_PASS_OUTPUT_SCHEMA = {
+        'type': 'object',
+        'additionalProperties': False,
+        'properties': {
+            'fixes': {
+                'type': 'array',
+                'description': (
+                    'Single-occurrence find/replace operations that '
+                    'correct gender / number / pronoun agreement '
+                    'drift in the translation against the canonical '
+                    'character morphology in the brief. Each old_str '
+                    'must appear EXACTLY ONCE in its target block — '
+                    'extend with surrounding context until uniqueness '
+                    'holds. Empty array is fine when no drift is '
+                    'found.'),
+                'items': {
+                    'type': 'object',
+                    'additionalProperties': False,
+                    'properties': {
+                        'block_index': {
+                            'type': 'integer',
+                            'description': (
+                                '0-based block_N index identifying '
+                                'the target paragraph this fix '
+                                'applies to.'),
+                        },
+                        'character_id': {
+                            'type': 'string',
+                            'description': (
+                                'c_NNN id of the character whose '
+                                'canonical morphology drives this '
+                                'fix. Empty string if not character-'
+                                'specific (e.g. a generic plural / '
+                                'collective-agreement fix).'),
+                        },
+                        'kind': {
+                            'type': 'string',
+                            'enum': ['gender', 'number', 'pronoun',
+                                     'other'],
+                            'description': (
+                                'Class of agreement error this fix '
+                                'addresses.'),
+                        },
+                        'old_str': {
+                            'type': 'string',
+                            'description': (
+                                'Verbatim character sequence from '
+                                'the target block that contains the '
+                                'agreement error. MUST appear '
+                                'EXACTLY ONCE in the block — extend '
+                                'with surrounding context until '
+                                'uniqueness is satisfied.'),
+                        },
+                        'new_str': {
+                            'type': 'string',
+                            'description': (
+                                'Replacement string with morphology '
+                                'corrected to match the canonical '
+                                'gender/number from the brief. '
+                                'Preserve everything except the '
+                                'agreement-bearing tokens (verb '
+                                'inflections, pronouns, adjective '
+                                'endings).'),
+                        },
+                        'reason': {
+                            'type': 'string',
+                            'description': (
+                                'One sentence: which character, '
+                                'which token(s), what canonical form '
+                                'is expected.'),
+                        },
+                    },
+                    'required': [
+                        'block_index', 'character_id', 'kind',
+                        'old_str', 'new_str', 'reason',
+                    ],
+                },
+            },
+        },
+        'required': ['fixes'],
+    }
+
     def _consistency_system_prompt(self, target_lang, attempt=0):
         """Build the system prompt for a consistency review attempt.
         Higher attempt numbers use stronger editorial-context framing
@@ -1453,6 +1556,330 @@ class ClaudeTranslate(GenAI):
             'glossary': [],
             'corrections': [],
             'raw_response': last_raw,
+        }
+
+    def _character_index(self, brief):
+        """Build a fast pre-filter index from the brief's characters.
+
+        Returns:
+          - id_to_char: {char_id: char_dict}
+          - mention_regex: compiled `\\b(form1|form2|...)\\b` matching
+            any character mention form (canonical_name, source_name,
+            aliases). None if there are no usable forms.
+
+        Used by agreement_review to skip paragraphs that mention no
+        named character — most prose paragraphs (description / non-
+        dialogue action) qualify, so this typically halves or better
+        the token cost of the pass.
+        """
+        if not brief or not isinstance(brief, dict):
+            return {'id_to_char': {}, 'mention_regex': None}
+        chars = brief.get('characters') or []
+        id_to_char = {}
+        forms = []
+        seen = set()
+        for c in chars:
+            if not isinstance(c, dict):
+                continue
+            cid = c.get('id') or ''
+            if not cid:
+                continue
+            id_to_char[cid] = c
+            for key in ('canonical_name', 'source_name'):
+                v = c.get(key)
+                if isinstance(v, str) and v.strip() and v not in seen:
+                    seen.add(v)
+                    forms.append(v)
+            for v in (c.get('aliases') or []):
+                if isinstance(v, str) and v.strip() and v not in seen:
+                    seen.add(v)
+                    forms.append(v)
+            for v in (c.get('variants') or []):
+                if isinstance(v, str) and v.strip() and v not in seen:
+                    seen.add(v)
+                    forms.append(v)
+        # Sort longest-first so re alternation prefers the longest
+        # match at any position (relevant when one form is a prefix
+        # of another).
+        forms.sort(key=len, reverse=True)
+        mention_regex = None
+        if forms:
+            try:
+                mention_regex = re.compile(
+                    r'\b(' + '|'.join(re.escape(f) for f in forms)
+                    + r')\b',
+                    re.UNICODE)
+            except re.error:
+                mention_regex = None
+        return {'id_to_char': id_to_char, 'mention_regex': mention_regex}
+
+    def _format_brief_morphology(self, chars):
+        """Render the brief's character morphology as a compact,
+        model-facing table. Only fields relevant to agreement (id,
+        canonical_name, gender, number) are included. Aliases are
+        listed so the model can map mention forms in the translation
+        to a single canonical character.
+        """
+        lines = []
+        for c in chars:
+            if not isinstance(c, dict):
+                continue
+            cid = c.get('id', '')
+            name = c.get('canonical_name', '')
+            gender = c.get('gender', '') or 'unknown'
+            number = c.get('number', '') or 'sg'
+            aliases = [a for a in (c.get('aliases') or [])
+                       if isinstance(a, str) and a.strip()]
+            line = '  • [{}] {} — gender: {}, number: {}'.format(
+                cid, name, gender, number)
+            if aliases:
+                line += '; aliases: ' + ', '.join(aliases)
+            lines.append(line)
+        return '\n'.join(lines) if lines else '  (no character data)'
+
+    def _agreement_system_prompt(self, target_lang, morphology):
+        """System prompt for the Agreement Pass. Editorial framing
+        aligned with the brief-build / consistency-review prompts:
+        the user owns the translation, this pass is a quality-
+        assurance step over their own output, not over copyrighted
+        source material. Sees only translated text + morphology.
+        """
+        return (
+            'You are an editorial assistant performing an AGREEMENT '
+            'PASS on a {tlang} translation. The user has produced '
+            'a {tlang} translation of a book in their personal '
+            'library; you are reviewing the translated text for '
+            'residual GENDER, NUMBER, and PRONOUN agreement drift '
+            'against a canonical character morphology table that '
+            'was prepared earlier (the Translation Brief). You see '
+            'only the translated text and the morphology table — '
+            'no copyrighted source material is present.\n'
+            '\n'
+            '═══ CANONICAL CHARACTER MORPHOLOGY ═══\n'
+            '{morph}\n'
+            '\n'
+            '═══ SCOPE ═══\n'
+            'Flag and fix in-place where the translation\'s verb '
+            'forms, pronouns, possessives, or adjective endings '
+            'disagree with a character\'s canonical gender or '
+            'number from the table above. Examples in '
+            'morphologically rich {tlang}:\n'
+            '  • A character marked feminine but referenced with '
+            'a masculine verb form.\n'
+            '  • A singular character referenced with plural '
+            'agreement (or vice versa).\n'
+            '  • A pronoun whose grammatical gender contradicts '
+            'the canonical gender of its antecedent.\n'
+            '\n'
+            'DO NOT FLAG:\n'
+            '  • The character\'s name itself (handled by the '
+            'terminology pass).\n'
+            '  • Style, word choice, naturalness, register.\n'
+            '  • Punctuation, quote marks, whitespace.\n'
+            '  • Anything that is not a target-language morphology '
+            '/ agreement issue.\n'
+            '  • Characters whose gender is "unknown" or "mixed" — '
+            'the brief is not authoritative about agreement for '
+            'those, so leave them alone.\n'
+            '  • Direct-speech inflection that uses the speaker\'s '
+            'addressee\'s morphology (a male character speaking to '
+            'a female uses feminine 2nd-person forms — that is '
+            'correct).\n'
+            '\n'
+            '═══ FIX SHAPE ═══\n'
+            'Each fix is a single-occurrence find/replace operation '
+            'against ONE block_N. Your "old_str" MUST appear '
+            'EXACTLY ONCE in that block; if the agreement error '
+            'lives on a common verb form that occurs multiple '
+            'times in the block, extend with surrounding context '
+            '(preceding noun, following word) until uniqueness '
+            'holds.\n'
+            '\n'
+            'The "new_str" must change ONLY the agreement-bearing '
+            'tokens (verb inflection, pronoun, adjective ending) '
+            '— preserve word order, content words, and punctuation '
+            'in the rest of the substring. Surgical edits, not '
+            'paraphrases.\n'
+            '\n'
+            'Set "kind" to "gender", "number", "pronoun", or '
+            '"other" matching the class of error. Set "character_'
+            'id" to the c_NNN id of the character whose canonical '
+            'morphology drove the fix; empty string if the fix is '
+            'not character-specific.\n'
+            '\n'
+            'Empty fixes array is fine if the translation is '
+            'already consistent. Do NOT invent issues to fill the '
+            'response.'
+        ).format(tlang=target_lang,
+                 morph=morphology or '  (no character data)')
+
+    def agreement_review(self, items, brief, on_progress=None,
+                         cancel_request=None):
+        """Detect residual gender/number/pronoun agreement drift in
+        translated paragraphs against the canonical character
+        morphology in the brief, and emit single-occurrence find/
+        replace fixes. Convergent: each fix is bounded, validated by
+        the host (uniqueness contract), and applied via plain string
+        replacement.
+
+        :items: list of {index, translation} dicts. Caller passes
+            only paragraphs with non-empty translations.
+        :brief: the canonical Translation Brief dict (drives which
+            characters to check and their canonical morphology).
+
+        Returns a dict:
+          - 'fixes': validated [{block_index, character_id, kind,
+                old_str, new_str, reason}] entries, each old_str
+                verified unique within its target block.
+          - 'unfixable': failures that didn't pass uniqueness
+                validation (surfaced for log inspection).
+          - 'considered': how many paragraphs were sent to the model
+                after pre-filtering.
+          - 'raw_response': raw text on parse failure.
+        """
+        empty_result = {
+            'fixes': [], 'unfixable': [], 'considered': 0,
+            'raw_response': '',
+        }
+        if not items or not brief:
+            return empty_result
+        chars = brief.get('characters') if isinstance(brief, dict) \
+            else None
+        if not chars:
+            return empty_result
+
+        cidx = self._character_index(brief)
+        mention_regex = cidx['mention_regex']
+        if mention_regex is None:
+            return empty_result
+
+        # Pre-filter: keep only translated paragraphs that mention
+        # at least one named character. Drops description-only
+        # paragraphs without a single named character mention.
+        relevant = []
+        for item in items:
+            text = (item.get('translation') or '').strip()
+            if not text:
+                continue
+            if mention_regex.search(text):
+                relevant.append({
+                    'index': item['index'],
+                    'translation': item['translation'],
+                })
+        if on_progress:
+            on_progress(_(
+                'Agreement Pass: {}/{} translated paragraphs '
+                'mention named characters; reviewing those.'
+            ).format(len(relevant), len(items)))
+        if not relevant:
+            return empty_result
+
+        target_lang = self.target_lang
+
+        # Build cached document blocks. cache_control on the last
+        # block caches the prefix (system prompt + morphology +
+        # documents); a future revalidate or repair call within the
+        # 1-hour TTL would hit the cache.
+        docs = []
+        block_text_by_index = {}
+        valid_indices = set()
+        for item in relevant:
+            idx = item['index']
+            text = item['translation']
+            block_text_by_index[idx] = text
+            valid_indices.add(idx)
+            docs.append({
+                'type': 'document',
+                'source': {
+                    'type': 'content',
+                    'content': [{'type': 'text', 'text': text}],
+                },
+                'title': 'block_{}'.format(idx),
+            })
+        if docs:
+            docs[-1]['cache_control'] = {
+                'type': 'ephemeral', 'ttl': '1h'}
+
+        morphology = self._format_brief_morphology(chars)
+        system_prompt = self._agreement_system_prompt(
+            target_lang, morphology)
+        trailing = (
+            'Above are {} translated blocks (titled "block_N", N '
+            'is the 0-indexed block position). Identify GENDER / '
+            'NUMBER / PRONOUN agreement errors against the '
+            'canonical character morphology table in the system '
+            'prompt and emit single-occurrence find/replace fixes. '
+            'Empty fixes array is fine if the translation is '
+            'already consistent.'
+        ).format(len(relevant))
+        content_blocks = docs + [{'type': 'text', 'text': trailing}]
+
+        if cancel_request and cancel_request():
+            return empty_result
+
+        result = self._consistency_api_call(
+            content_blocks, system_prompt, on_progress,
+            cancel_request, valid_indices=valid_indices,
+            schema=self._AGREEMENT_PASS_OUTPUT_SCHEMA)
+        parsed = result.get('parsed') or {}
+        raw_fixes = parsed.get('fixes') if isinstance(parsed, dict) \
+            else None
+        if not isinstance(raw_fixes, list):
+            return {
+                'fixes': [], 'unfixable': [],
+                'considered': len(relevant),
+                'raw_response': result.get('raw_response') or '',
+            }
+
+        # Validate uniqueness via the existing helper (which expects
+        # the consistency-review corrections shape: a list of
+        # {index, replacements:[{old_str, new_str}]} entries). Group
+        # fixes by block_index, run validation, then map back to the
+        # fixes shape carrying through metadata (character_id, kind,
+        # reason) keyed by (block_index, old_str, new_str).
+        fix_meta = {}
+        by_block = {}
+        for f in raw_fixes:
+            if not isinstance(f, dict):
+                continue
+            idx = f.get('block_index')
+            if not isinstance(idx, int) or idx not in valid_indices:
+                continue
+            old_str = f.get('old_str') or ''
+            new_str = f.get('new_str') or ''
+            if not old_str or old_str == new_str:
+                continue
+            fix_meta[(idx, old_str, new_str)] = f
+            by_block.setdefault(idx, []).append({
+                'old_str': old_str, 'new_str': new_str,
+            })
+        corrections = [
+            {'index': idx, 'reason': '', 'replacements': reps}
+            for idx, reps in by_block.items()
+        ]
+        resolved, failures = self._validate_corrections(
+            corrections, block_text_by_index)
+
+        flat_fixes = []
+        for c in resolved:
+            idx = c['index']
+            for r in c.get('replacements', []):
+                meta = fix_meta.get(
+                    (idx, r['old_str'], r['new_str']), {})
+                flat_fixes.append({
+                    'block_index': idx,
+                    'character_id': meta.get('character_id') or '',
+                    'kind': meta.get('kind') or 'other',
+                    'old_str': r['old_str'],
+                    'new_str': r['new_str'],
+                    'reason': meta.get('reason') or '',
+                })
+
+        return {
+            'fixes': flat_fixes,
+            'unfixable': failures,
+            'considered': len(relevant),
+            'raw_response': result.get('raw_response') or '',
         }
 
     def _brief_system_prompt(self, source_lang, target_lang,

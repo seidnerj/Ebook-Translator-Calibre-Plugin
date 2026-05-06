@@ -278,6 +278,80 @@ class TranslationWorker(QObject):
         log('═' * 50)
         return brief
 
+    def _auto_agreement_pass(self, translator, log):
+        """Run the Agreement Pass over every paragraph in the cache
+        immediately after drafting completes. Quieter logging than
+        the manual-button path; fixes are applied to cache and the
+        UI is refreshed via callback as each paragraph mutates.
+        """
+        paragraphs = self.cache.all_paragraphs() or []
+        items = []
+        for i, p in enumerate(paragraphs):
+            t = (getattr(p, 'translation', None) or '').strip()
+            if t:
+                items.append({'index': i,
+                              'translation': p.translation})
+        if not items:
+            return
+        log('═' * 50)
+        log(_('Running post-translation Agreement Pass...'))
+        result = translator.agreement_review(
+            items, self.brief, on_progress=log,
+            cancel_request=self.cancel_request)
+        fixes = result.get('fixes') or []
+        unfixable = result.get('unfixable') or []
+        considered = result.get('considered', 0)
+
+        applied = 0
+        char_index = {}
+        for c in (self.brief.get('characters') or []):
+            if isinstance(c, dict) and c.get('id'):
+                char_index[c['id']] = c
+        for f in fixes:
+            idx = f.get('block_index')
+            old_str = f.get('old_str') or ''
+            new_str = f.get('new_str') or ''
+            if (not isinstance(idx, int)
+                    or idx < 0 or idx >= len(paragraphs)
+                    or not old_str or old_str == new_str):
+                continue
+            p = paragraphs[idx]
+            t = getattr(p, 'translation', None) or ''
+            if t.count(old_str) != 1:
+                continue
+            p.translation = t.replace(old_str, new_str, 1)
+            applied += 1
+            try:
+                self.cache.update_paragraph(p)
+            except Exception:
+                pass
+            try:
+                self.callback.emit(p)
+            except Exception:
+                pass
+            cid = f.get('character_id') or ''
+            cname = (char_index.get(cid, {}).get('canonical_name')
+                     if cid else '') or cid or '—'
+            kind = f.get('kind') or 'other'
+            log('  ✓ block_{} [{}] {} — {!r} → {!r}'.format(
+                idx, kind, cname, old_str, new_str))
+        if unfixable:
+            log(_('Rejected (uniqueness failed): {}').format(
+                len(unfixable)))
+        log(_('Agreement Pass: reviewed {} character-mentioning '
+              'paragraph(s); {} fix(es) applied.').format(
+            considered, applied))
+        try:
+            from datetime import datetime
+            ts = datetime.now().strftime('%Y-%m-%d %H:%M')
+            self.cache.set_info('last_agreement_pass', ts)
+        except Exception:
+            pass
+        try:
+            self.agreement_completed.emit(applied)
+        except Exception:
+            pass
+
     @pyqtSlot(list, bool)
     def translate_paragraphs(self, paragraphs=[], fresh=False):
         """:fresh: retranslate all paragraphs."""
@@ -335,6 +409,29 @@ class TranslationWorker(QObject):
         translation.set_callback(self.callback.emit)
         translation.set_cancel_request(self.cancel_request)
         translation.handle(paragraphs)
+
+        # ── Auto-trigger Agreement Pass ────────────────────────────
+        # Once drafting is complete, run a post-translation
+        # Agreement Pass to fix residual gender/number/pronoun drift
+        # against the brief's canonical morphology. Gated on the
+        # same setting that gates the manual button — disabling the
+        # setting suppresses both the button and this auto-run.
+        # Cancellation, missing brief, or unsupported engine all
+        # silently skip (logged, non-fatal).
+        if (not self.cancel_request()
+                and self.brief is not None
+                and self.cache is not None
+                and getattr(translator, 'supports_agreement_review',
+                            False)
+                and getattr(translator, 'enable_agreement_pass',
+                            False)
+                and hasattr(translator, 'agreement_review')):
+            try:
+                self._auto_agreement_pass(translator, log)
+            except Exception as e:
+                log(_('Auto Agreement Pass failed: {}').format(
+                    str(e)), True)
+
         self.on_working = False
         self.finished.emit()
         if self.need_close:

@@ -542,229 +542,119 @@ class Translation:
             self.log(_('Consistency pass failed: {}').format(str(e)), True)
             return
 
-        # Backwards compatibility: older return shape was a flat list of
-        # corrections. New shape is {'glossary': [...], 'corrections': [...],
-        # 'raw_response': '...'}.
-        if isinstance(review, list):
-            glossary = []
-            corrections = review
-            raw_response = ''
-        elif isinstance(review, dict):
+        # Glossary-first design: the model's role is judgment
+        # (which form is canonical, what variants exist) — the host
+        # does substitution via deterministic word-boundary regex.
+        # No corrections array; no validation/repair loop.
+        if isinstance(review, dict):
             glossary = review.get('glossary') or []
-            corrections = review.get('corrections') or []
             raw_response = review.get('raw_response') or ''
         else:
             glossary = []
-            corrections = []
             raw_response = ''
 
-        # Confirmation line so the user can tell empty results apart from
-        # "the response didn't parse" or "we received nothing".
         self.log(sep('┈'))
-        self.log(_('Received from model: {} glossary entries, {} '
-                   'corrections.').format(len(glossary), len(corrections)))
+        self.log(_('Received from model: {} glossary entries.')
+                 .format(len(glossary)))
 
-        # If we received nothing AND have a raw response, surface a
-        # truncated excerpt so the user can see what the model actually
-        # said (e.g. malformed JSON, refusal text, etc.).
-        if not glossary and not corrections and raw_response:
+        if not glossary and raw_response:
             excerpt = raw_response[:1000] + (
                 '...' if len(raw_response) > 1000 else '')
             self.log(_('Raw response (parsing produced no usable '
                        'output):'), True)
             self.log(excerpt, True)
 
-        # Log the extracted glossary for transparency. This shows the user
-        # what canonical translations the model used as the consistency
-        # reference — useful for review and for future manual edits.
-        if glossary:
-            self.log(sep('┈'))
-            self.log(_('Glossary ({} entries):').format(len(glossary)))
-            for g in glossary:
-                term = g.get('term', '')
-                canonical = g.get('canonical', '')
-                gtype = g.get('type', '')
-                notes = g.get('notes', '')
-                # Format: "Alex → אלכסה (character, feminine)"
-                meta_parts = [p for p in (gtype, notes) if p]
-                meta = ' ({})'.format(', '.join(meta_parts)) if meta_parts \
-                    else ''
-                self.log('  {} → {}{}'.format(term, canonical, meta))
-
-        if not corrections:
-            self.log(_('Consistency pass: no inconsistencies found.'))
+        if not glossary:
+            self.log(_('Consistency pass: no glossary returned.'))
             return
 
-        # Apply each correction as a set of Nth-occurrence replacements
-        # against the ORIGINAL paragraph text, computed and validated
-        # in a single pass. The model specifies a 1-indexed occurrence
-        # for each replacement (no "replace all" shortcut).
-        #
-        # Atomicity: if any replacement in a correction is invalid
-        # (find missing, occurrence too high, overlapping span), the
-        # ENTIRE correction is skipped — the paragraph is never left
-        # in a partially-corrected state.
-        #
-        # Implementation: resolve every replacement to a (start, end,
-        # replace_str) triple against the original text. Sort by start
-        # position. Reject if any spans overlap. Then reconstruct the
-        # new text in one pass by walking the original. This avoids
-        # all index-shifting concerns because every position is
-        # computed before any text is modified.
-        def _resolve_replacements(text, replacements):
-            """Resolve each replacement to a (start, end, replace_str,
-            find, occurrence) tuple in the original text. Returns
-            (resolved, errors). Sorted by start position. Detects
-            overlapping spans and adds them to errors."""
-            resolved = []
-            errors = []
-            for r in replacements:
-                find_str = r.get('find', '')
-                replace_str = r.get('replace', '')
-                occurrence = r.get('occurrence', 0)
-                if not find_str:
-                    errors.append((
-                        find_str, replace_str, occurrence,
-                        'empty find string'))
-                    continue
-                if (not isinstance(occurrence, int)
-                        or occurrence < 1):
-                    errors.append((
-                        find_str, replace_str, occurrence,
-                        'invalid occurrence (must be >= 1)'))
-                    continue
-                # Locate the Nth occurrence in the original text.
-                pos = -1
-                count = 0
-                search = 0
-                while True:
-                    found = text.find(find_str, search)
-                    if found < 0:
-                        break
-                    count += 1
-                    if count == occurrence:
-                        pos = found
-                        break
-                    search = found + 1
-                if pos < 0:
-                    errors.append((
-                        find_str, replace_str, occurrence,
-                        'only {} occurrences in paragraph'.format(count)))
-                    continue
-                resolved.append((
-                    pos, pos + len(find_str), replace_str,
-                    find_str, occurrence))
-            # Sort by start position for overlap detection + rebuilding
-            resolved.sort(key=lambda x: x[0])
-            # Detect overlapping spans
-            for i in range(len(resolved) - 1):
-                if resolved[i][1] > resolved[i + 1][0]:
-                    a = resolved[i]
-                    b = resolved[i + 1]
-                    errors.append((
-                        b[3], b[2], b[4],
-                        'span [{}:{}] overlaps with prior [{}:{}] for '
-                        '"{}" #{}'.format(b[0], b[1], a[0], a[1],
-                                          a[3], a[4])))
-                    return None, errors
-            return resolved, errors
+        # Log the glossary for transparency.
+        self.log(sep('┈'))
+        self.log(_('Glossary ({} entries):').format(len(glossary)))
+        for g in glossary:
+            canonical = g.get('canonical', '')
+            variants = g.get('variants') or []
+            gtype = g.get('type', '')
+            gender = g.get('gender', '')
+            notes = g.get('notes', '')
+            meta_parts = [p for p in (gtype, gender, notes) if p]
+            meta = ' ({})'.format(', '.join(meta_parts)) if meta_parts \
+                else ''
+            if variants:
+                self.log('  {} ← [{}]{}'.format(
+                    canonical, ', '.join(variants), meta))
+            else:
+                self.log('  {} (informational){}'.format(canonical, meta))
 
-        # Pass-wide atomicity: validate ALL corrections first WITHOUT
-        # mutating any paragraph. Only if every correction is fully
-        # resolvable (every replacement found at the expected
-        # occurrence, no overlaps) do we apply anything. If any error
-        # is detected anywhere, the entire pass is aborted — no
-        # paragraph is touched.
-        #
-        # Rationale: if the model made any verifiable error, we can't
-        # trust the correction set as a whole. Partial application
-        # would leave the user uncertain which corrections went
-        # through, especially since the cache is updated per-row via
-        # the callback. All-or-nothing eliminates that ambiguity.
+        # Build a flat list of (variant, canonical, entry_index) tuples
+        # sorted by variant length descending. Longest-first ordering
+        # prevents shorter variants from corrupting longer matches —
+        # e.g., if "אש המלאך" and "אש המלאך הראשי" are both variants
+        # of one entity, we want to substitute the longer one first.
+        substitutions = []
+        for entry_idx, g in enumerate(glossary):
+            canonical = g.get('canonical', '')
+            for variant in (g.get('variants') or []):
+                if variant and variant != canonical:
+                    substitutions.append((variant, canonical, entry_idx))
+        substitutions.sort(key=lambda x: -len(x[0]))
 
-        # Pass 1: resolve all corrections, collect errors
-        per_correction = []  # (paragraph, correction, resolved, errors)
-        total_errors = 0
-        for c in corrections:
+        if not substitutions:
+            self.log(_('Consistency pass: glossary contains no '
+                       'actionable variants.'))
+            return
+
+        # Apply each substitution as a word-boundary regex over every
+        # paragraph's translation. Word boundaries (\b) work on
+        # Unicode word characters in Python 3 — includes Hebrew,
+        # Arabic, etc. — and prevent substring corruption (e.g.
+        # "אשקום" inside "אשקומב" doesn't match because \b at the
+        # end requires a non-word char after, but ב is a word char).
+        import re
+        applied_paragraphs = 0
+        total_substitutions = 0
+        per_variant_counts = {}
+        for paragraph in (index_to_paragraph[i['index']]
+                          for i in items
+                          if i['index'] in index_to_paragraph):
             if self.cancel_request():
                 break
-            paragraph = index_to_paragraph.get(c['index'])
-            if paragraph is None:
-                continue
-            replacements = c.get('replacements') or []
-            resolved, errors = _resolve_replacements(
-                paragraph.translation, replacements)
-            per_correction.append((paragraph, c, resolved, errors))
-            if errors or resolved is None:
-                total_errors += len(errors) if errors else 1
-
-        if self.cancel_request():
-            return
-
-        # Pass 2: if ANY error occurred anywhere, abort the entire pass
-        if total_errors > 0:
-            self.log(sep('┈'))
-            self.log(_('Consistency pass ABORTED: {} replacement '
-                       'error(s) detected. No paragraphs were '
-                       'modified.').format(total_errors))
-            for paragraph, c, resolved, errors in per_correction:
-                if not errors:
-                    continue
+            text = paragraph.translation
+            original = text
+            paragraph_subs = []  # (variant, canonical, count)
+            for variant, canonical, _idx in substitutions:
+                pattern = r'\b' + re.escape(variant) + r'\b'
+                new_text, n = re.subn(pattern, canonical, text)
+                if n > 0:
+                    paragraph_subs.append((variant, canonical, n))
+                    total_substitutions += n
+                    per_variant_counts[variant] = (
+                        per_variant_counts.get(variant, 0) + n)
+                    text = new_text
+            if text != original:
+                paragraph.translation = text
+                if self.translator.merge_enabled:
+                    paragraph.do_aligment(self.translator.separator)
+                applied_paragraphs += 1
                 row_label = (paragraph.row if paragraph.row >= 0
-                             else c['index'])
+                             else paragraph_subs[0][0])
                 self.log(sep('┈'))
-                self.log(_('Row {} (rejected): {}')
-                         .format(row_label, c.get('reason', '')))
-                for f, repl, occ, reason in errors:
-                    self.log(_('  ✗ [#{}] {} → {} ({})')
-                             .format(occ, f, repl, reason))
-                if resolved:
-                    for start, end, repl, f, occ in resolved:
-                        self.log(_('  - [#{}] {} → {} (would have '
-                                   'applied at [{}:{}], discarded '
-                                   'due to errors elsewhere)')
-                                 .format(occ, f, repl, start, end))
-            return
-
-        # Pass 3: all corrections valid — apply each one in one pass
-        applied = 0
-        for paragraph, c, resolved, errors in per_correction:
-            if self.cancel_request():
-                break
-            if not resolved:
-                # Empty replacement list is unexpected but harmless
-                continue
-            row_label = (paragraph.row if paragraph.row >= 0
-                         else c['index'])
-            old_translation = paragraph.translation
-
-            # Build new text in one pass against the original.
-            parts = []
-            cursor = 0
-            for start, end, repl, _f, _occ in resolved:
-                parts.append(old_translation[cursor:start])
-                parts.append(repl)
-                cursor = end
-            parts.append(old_translation[cursor:])
-            new_translation = ''.join(parts)
-
-            paragraph.translation = new_translation
-            if self.translator.merge_enabled:
-                paragraph.do_aligment(self.translator.separator)
-            applied += 1
-            self.log(sep('┈'))
-            self.log(_('Corrected row {}: {}')
-                     .format(row_label, c.get('reason', '')))
-            for start, end, repl, f, occ in resolved:
-                self.log(_('  ✓ [#{}] {} → {} (at [{}:{}])')
-                         .format(occ, f, repl, start, end))
-            # Trigger cache update + UI refresh through the existing
-            # callback (advanced.py's translation_callback handles this).
-            self.callback(paragraph)
+                self.log(_('Row {}:').format(row_label))
+                for variant, canonical, n in paragraph_subs:
+                    self.log('  ✓ {} → {} (×{})'.format(
+                        variant, canonical, n))
+                self.callback(paragraph)
 
         self.log(sep('┈'))
-        self.log(_('Consistency pass: applied {} correction(s).')
-                 .format(applied))
+        self.log(_('Consistency pass: applied {} substitution(s) '
+                   'across {} paragraph(s).')
+                 .format(total_substitutions, applied_paragraphs))
+        if per_variant_counts:
+            self.log(_('Per-variant totals:'))
+            for variant in sorted(per_variant_counts,
+                                  key=lambda v: -per_variant_counts[v]):
+                self.log('  {} ×{}'.format(
+                    variant, per_variant_counts[variant]))
 
 
 def get_engine_class(engine_name=None):

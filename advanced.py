@@ -431,7 +431,8 @@ class TranslationWorker(QObject):
                             False)
                 and getattr(translator, 'enable_agreement_pass',
                             False)
-                and hasattr(translator, 'agreement_review')):
+                and hasattr(translator, 'agreement_review')
+                and not self.cache.get_info('agreement_pass_fixes')):
             try:
                 self._auto_agreement_pass(translator, log)
             except Exception as e:

@@ -1454,20 +1454,27 @@ class AdvancedTranslation(QDialog):
             if not visible:
                 return
             has_source = self.table.rowCount() > 0
+            has_translation = _has_any_translation()
+            # Build Brief only needs source; the other two need translations.
             consistency_pass_action.setEnabled(has_source)
-            if has_source:
-                consistency_pass_action.setToolTip(_(
-                    'Build a Translation Brief — a structured '
-                    'reference document with canonical names, '
-                    'character profiles (with grammatical gender '
-                    'for verb/adjective agreement), recurring '
-                    'terminology, and style decisions. Cached and '
-                    'reused on every subsequent translation; click '
-                    'to rebuild.\n\nLast run: {}'
-                ).format(_last_consistency_pass_label()))
-            else:
-                consistency_pass_action.setToolTip(_(
-                    'Disabled until source paragraphs are loaded.'))
+            consistency_glossary_action.setEnabled(has_translation)
+            consistency_pass_action.setToolTip(_(
+                'Build a Translation Brief from source text — '
+                'canonical names, character profiles (with '
+                'grammatical gender), recurring terminology, and '
+                'style decisions. Cached per-book; click to '
+                'rebuild.\n\nLast run: {}'
+            ).format(_last_consistency_pass_label()) if has_source
+            else _('Disabled until source paragraphs are loaded.'))
+            consistency_glossary_action.setToolTip(_(
+                'Scan translated paragraphs for inconsistent name / '
+                'term spellings and build a substitution glossary. '
+                'Applied at export time; cached per-book; click to '
+                'rebuild.\n\nLast run: {}'
+            ).format(self.cache.get_info(
+                'last_consistency_pass_glossary') or _('never')
+            ) if has_translation
+            else _('Disabled until at least one paragraph is translated.'))
 
         # Save references the callback chain can reach.
         self.update_consistency_pass_button = update_consistency_pass_button

@@ -280,10 +280,13 @@ class TranslationWorker(QObject):
 
     def _auto_agreement_pass(self, translator, log):
         """Run the Agreement Pass over every paragraph in the cache
-        immediately after drafting completes. Quieter logging than
-        the manual-button path; fixes are applied to cache and the
-        UI is refreshed via callback as each paragraph mutates.
+        immediately after drafting completes. Fixes are stored as a
+        separate cache key (agreement_pass_fixes) and applied at
+        export time — raw paragraph translations in the cache are
+        never modified. In-memory paragraph objects are mutated for
+        table display only.
         """
+        import json as _json
         paragraphs = self.cache.all_paragraphs() or []
         items = []
         for i, p in enumerate(paragraphs):
@@ -302,7 +305,7 @@ class TranslationWorker(QObject):
         unfixable = result.get('unfixable') or []
         considered = result.get('considered', 0)
 
-        applied = 0
+        applied_fixes = []
         char_index = {}
         for c in (self.brief.get('characters') or []):
             if isinstance(c, dict) and c.get('id'):
@@ -319,12 +322,10 @@ class TranslationWorker(QObject):
             t = getattr(p, 'translation', None) or ''
             if t.count(old_str) != 1:
                 continue
+            # Mutate in-memory only — for table display.
+            # Raw translation in cache is preserved.
             p.translation = t.replace(old_str, new_str, 1)
-            applied += 1
-            try:
-                self.cache.update_paragraph(p)
-            except Exception:
-                pass
+            applied_fixes.append(f)
             try:
                 self.callback.emit(p)
             except Exception:
@@ -339,16 +340,19 @@ class TranslationWorker(QObject):
             log(_('Rejected (uniqueness failed): {}').format(
                 len(unfixable)))
         log(_('Agreement Pass: reviewed {} character-mentioning '
-              'paragraph(s); {} fix(es) applied.').format(
-            considered, applied))
+              'paragraph(s); {} fix(es) will be applied at '
+              'export.').format(considered, len(applied_fixes)))
         try:
+            self.cache.set_info(
+                'agreement_pass_fixes',
+                _json.dumps(applied_fixes, ensure_ascii=False))
             from datetime import datetime
             ts = datetime.now().strftime('%Y-%m-%d %H:%M')
             self.cache.set_info('last_agreement_pass', ts)
         except Exception:
             pass
         try:
-            self.agreement_completed.emit(applied)
+            self.agreement_completed.emit(len(applied_fixes))
         except Exception:
             pass
 
@@ -696,7 +700,7 @@ class TranslationWorker(QObject):
                   '{} rejected by uniqueness check.').format(
                 considered, len(fixes), len(unfixable)))
 
-            applied = 0
+            applied_fixes = []
             char_index = {}
             for c in (brief.get('characters') or []):
                 if isinstance(c, dict) and c.get('id'):
@@ -711,18 +715,12 @@ class TranslationWorker(QObject):
                     continue
                 p = paragraphs[idx]
                 t = getattr(p, 'translation', None) or ''
-                # Re-verify count == 1 at apply time (engine may
-                # have validated against the same text, but be
-                # defensive).
                 if t.count(old_str) != 1:
                     continue
+                # Mutate in-memory only — for table display.
+                # Raw translation in cache is preserved.
                 p.translation = t.replace(old_str, new_str, 1)
-                applied += 1
-                if self.cache is not None:
-                    try:
-                        self.cache.update_paragraph(p)
-                    except Exception:
-                        pass
+                applied_fixes.append(f)
                 # Surface to the table so the user sees the change.
                 try:
                     self.callback.emit(p)
@@ -747,10 +745,20 @@ class TranslationWorker(QObject):
                         u.get('new_str', ''),
                         u.get('reason', '')))
 
+            # Persist fixes as a separate cache key — applied at
+            # export time, not baked into paragraph translations.
+            if self.cache is not None:
+                try:
+                    self.cache.set_info(
+                        'agreement_pass_fixes',
+                        _json.dumps(applied_fixes, ensure_ascii=False))
+                except Exception:
+                    pass
+
             log('═' * 50)
-            log(_('Agreement Pass complete: {} fix(es) applied.')
-                .format(applied))
-            self.agreement_completed.emit(applied)
+            log(_('Agreement Pass complete: {} fix(es) queued for '
+                  'export.').format(len(applied_fixes)))
+            self.agreement_completed.emit(len(applied_fixes))
         except Exception as e:
             log(_('Agreement Pass failed: {}').format(str(e)), True)
             log(traceback_error(), True)

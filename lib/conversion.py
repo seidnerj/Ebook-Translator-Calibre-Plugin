@@ -49,7 +49,8 @@ class PrepareStream:
 
 def convert_book(
         input_path, output_path, translation, element_handler, cache,
-        debug_info, encoding, notification) -> None:
+        debug_info, encoding, notification,
+        apply_agreement_fixes=True) -> None:
     """Process ebooks that Calibre supported."""
     plumber = Plumber(
         input_path, output_path, log=log, report_progress=notification)
@@ -72,6 +73,40 @@ def convert_book(
 
         paragraphs = cache.all_paragraphs()
         translation.handle(paragraphs)
+
+        # Apply Agreement Pass fixes (stored separately so the raw
+        # paragraph translations in cache are never overwritten).
+        # Gated on apply_agreement_fixes so the toggle in settings
+        # controls both computation and application. Fixes are
+        # validated against current paragraph text at apply time —
+        # a mismatched old_str (e.g. paragraph retranslated since
+        # the pass ran) is silently skipped.
+        if apply_agreement_fixes:
+            try:
+                import json as _json
+                fixes_json = cache.get_info('agreement_pass_fixes')
+                if fixes_json:
+                    fixes = _json.loads(fixes_json)
+                    n_applied = 0
+                    for f in (fixes or []):
+                        idx = f.get('block_index')
+                        old_str = f.get('old_str') or ''
+                        new_str = f.get('new_str') or ''
+                        if (not isinstance(idx, int)
+                                or idx < 0 or idx >= len(paragraphs)
+                                or not old_str or old_str == new_str):
+                            continue
+                        t = paragraphs[idx].translation or ''
+                        if t.count(old_str) == 1:
+                            paragraphs[idx].translation = t.replace(
+                                old_str, new_str, 1)
+                            n_applied += 1
+                    if n_applied:
+                        log.info(_('Agreement Pass: applied {} fix(es) '
+                                   'at export.').format(n_applied))
+            except Exception:
+                pass
+
         element_handler.add_translations(paragraphs)
 
         log.info(sep())
@@ -239,11 +274,19 @@ def convert_item(
     debug_info += '| Input Path: %s\n' % input_path
     debug_info += '| Output Path: %s' % output_path
 
+    apply_agreement_fixes = getattr(
+        translator, 'enable_agreement_pass', False)
+
     handler: dict[str, Callable] | None = extra_formats.get(format)
-    convertor = convert_book if handler is None else handler['convertor']
-    convertor(
-        input_path, output_path, translation, element_handler, cache,
-        debug_info, encoding, notification)
+    if handler is None:
+        convert_book(
+            input_path, output_path, translation, element_handler,
+            cache, debug_info, encoding, notification,
+            apply_agreement_fixes=apply_agreement_fixes)
+    else:
+        handler['convertor'](
+            input_path, output_path, translation, element_handler,
+            cache, debug_info, encoding, notification)
     cache.done()
 
 

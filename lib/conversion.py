@@ -50,7 +50,8 @@ class PrepareStream:
 def convert_book(
         input_path, output_path, translation, element_handler, cache,
         debug_info, encoding, notification,
-        apply_agreement_fixes=True) -> None:
+        apply_agreement_fixes=True,
+        apply_consistency_glossary=True) -> None:
     """Process ebooks that Calibre supported."""
     plumber = Plumber(
         input_path, output_path, log=log, report_progress=notification)
@@ -73,6 +74,45 @@ def convert_book(
 
         paragraphs = cache.all_paragraphs()
         translation.handle(paragraphs)
+
+        # Apply Consistency Pass glossary substitutions (stored
+        # separately so raw paragraph translations are never
+        # overwritten). Word-boundary regex, longest-first ordering.
+        if apply_consistency_glossary:
+            try:
+                import re as _re
+                import json as _json_cp
+                glossary_json = cache.get_info(
+                    'consistency_pass_glossary')
+                if glossary_json:
+                    glossary = _json_cp.loads(glossary_json)
+                    substitutions = []
+                    for g in (glossary or []):
+                        canonical = g.get('canonical', '')
+                        for variant in (g.get('variants') or []):
+                            if variant and variant != canonical:
+                                substitutions.append(
+                                    (variant, canonical))
+                    substitutions.sort(key=lambda x: -len(x[0]))
+                    n_applied = 0
+                    for p in paragraphs:
+                        if not p.translation:
+                            continue
+                        text = p.translation
+                        for variant, canonical in substitutions:
+                            pattern = (r'\b' + _re.escape(variant)
+                                       + r'\b')
+                            text, n = _re.subn(
+                                pattern, canonical, text)
+                            n_applied += n
+                        p.translation = text
+                    if n_applied:
+                        log.info(_(
+                            'Consistency Pass: applied {} '
+                            'substitution(s) at export.'
+                        ).format(n_applied))
+            except Exception:
+                pass
 
         # Apply Agreement Pass fixes (stored separately so the raw
         # paragraph translations in cache are never overwritten).
@@ -276,13 +316,18 @@ def convert_item(
 
     apply_agreement_fixes = getattr(
         translator, 'enable_agreement_pass', False)
+    apply_consistency_glossary = getattr(
+        translator, 'enable_consistency_pass', False)
+
+    translation.set_cache(cache)
 
     handler: dict[str, Callable] | None = extra_formats.get(format)
     if handler is None:
         convert_book(
             input_path, output_path, translation, element_handler,
             cache, debug_info, encoding, notification,
-            apply_agreement_fixes=apply_agreement_fixes)
+            apply_agreement_fixes=apply_agreement_fixes,
+            apply_consistency_glossary=apply_consistency_glossary)
     else:
         handler['convertor'](
             input_path, output_path, translation, element_handler,

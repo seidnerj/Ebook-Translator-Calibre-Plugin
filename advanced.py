@@ -6,7 +6,7 @@ from qt.core import (  # type: ignore
     QPlainTextEdit, QPushButton, QSplitter, QLabel, QThread, QLineEdit,
     QGridLayout, QProgressBar, pyqtSignal, pyqtSlot, QPixmap, QEvent,
     QStackedWidget, QSpacerItem, QTabWidget, QCheckBox,
-    QComboBox, QSizePolicy, QTextCursor, QToolButton, QMenu, QAction)
+    QComboBox, QSizePolicy, QTextCursor, QMenu, QAction)
 from calibre.constants import __version__  # type: ignore
 from calibre.gui2 import I  # type: ignore
 from calibre.utils.localization import _  # type: ignore
@@ -164,6 +164,8 @@ class TranslationWorker(QObject):
     translate = pyqtSignal(list, bool)
     consistency = pyqtSignal(list)
     consistency_completed = pyqtSignal()
+    consistency_glossary = pyqtSignal(list)
+    consistency_glossary_completed = pyqtSignal(int)
     agreement = pyqtSignal(list)
     agreement_completed = pyqtSignal(int)
     logging = pyqtSignal(str, bool)
@@ -193,6 +195,8 @@ class TranslationWorker(QObject):
         self.cache = None
         self.translate.connect(self.translate_paragraphs)
         self.consistency.connect(self.run_consistency_pass)
+        self.consistency_glossary.connect(
+            self.run_consistency_pass_glossary)
         self.agreement.connect(self.run_agreement_pass)
         # self.finished.connect(lambda: self.set_canceled(False))
 
@@ -409,6 +413,7 @@ class TranslationWorker(QObject):
 
         translation = get_translation(translator)
         translation.set_fresh(fresh)
+        translation.set_cache(self.cache)
         translation.set_logging(
             lambda text, error=False: self.logging.emit(text, error))
         translation.set_streaming(self.streaming.emit)
@@ -616,6 +621,82 @@ class TranslationWorker(QObject):
             self.consistency_completed.emit()
         except Exception as e:
             log(_('Brief build failed: {}').format(str(e)), True)
+            log(traceback_error(), True)
+        finally:
+            self.on_working = False
+            self.finished.emit()
+
+    @pyqtSlot(list)
+    def run_consistency_pass_glossary(self, paragraphs=[]):
+        """Manually rebuild the Consistency Pass glossary from the
+        current translated paragraphs and store it in cache. Does NOT
+        modify paragraph translations — substitutions are applied at
+        export time only."""
+        import json as _json
+        self.on_working = True
+        self.start.emit()
+        translator = get_translator(self.current_engine)
+        translator.set_source_lang(self.source_lang)
+        translator.set_target_lang(self.target_lang)
+        log = lambda text, error=False: self.logging.emit(text, error)
+
+        if not hasattr(translator, 'consistency_review'):
+            log(_('Consistency Pass is not supported by this '
+                  'engine.'), True)
+            self.on_working = False
+            self.finished.emit()
+            return
+
+        try:
+            items = []
+            for i, p in enumerate(paragraphs):
+                t = (getattr(p, 'translation', None) or '').strip()
+                if t:
+                    items.append({'index': i,
+                                  'translation': p.translation})
+            if not items:
+                log(_('No translated paragraphs to review.'), True)
+                return
+
+            log('═' * 50)
+            log(_('Running Consistency Pass...'))
+            log(_('Reviewing {} translated paragraph(s).')
+                .format(len(items)))
+
+            review = translator.consistency_review(
+                items, on_progress=log,
+                cancel_request=self.cancel_request)
+            glossary = (review.get('glossary') or []
+                        if isinstance(review, dict) else [])
+
+            log('─' * 50)
+            log(_('Consistency Pass: {} glossary entry(s).')
+                .format(len(glossary)))
+            for g in glossary:
+                canonical = g.get('canonical', '')
+                variants = g.get('variants') or []
+                if variants:
+                    log('  {} ← [{}]'.format(
+                        canonical, ', '.join(variants)))
+
+            if self.cache is not None and glossary:
+                self.cache.set_info(
+                    'consistency_pass_glossary',
+                    _json.dumps(glossary, ensure_ascii=False))
+                try:
+                    from datetime import datetime
+                    self.cache.set_info(
+                        'last_consistency_pass_glossary',
+                        datetime.now().strftime('%Y-%m-%d %H:%M'))
+                except Exception:
+                    pass
+
+            log('═' * 50)
+            log(_('Consistency Pass complete: glossary cached for '
+                  'export ({} entries).').format(len(glossary)))
+            self.consistency_glossary_completed.emit(len(glossary))
+        except Exception as e:
+            log(_('Consistency Pass failed: {}').format(str(e)), True)
             log(traceback_error(), True)
         finally:
             self.on_working = False
@@ -1289,18 +1370,18 @@ class AdvancedTranslation(QDialog):
         # user wants to regenerate the brief explicitly — e.g. after
         # discovering issues in the brief or after editing source
         # paragraphs.
-        # Dropdown button combining Build Brief and Run Agreement
-        # Pass — both are Claude-specific preparation actions that
-        # share the same visibility/enable logic, so they live under
-        # one "Prepare ▼" menu to avoid crowding the toolbar.
-        prepare_button = QToolButton()
-        prepare_button.setText('  %s  ' % _('Prepare ▼'))
-        prepare_button.setPopupMode(QToolButton.InstantPopup)
+        # Dropdown button combining all Claude-specific preparation
+        # actions. Uses QPushButton + setMenu so it inherits the
+        # same native rounded style as the other toolbar buttons.
+        prepare_button = QPushButton('  %s  ' % _('Prepare ▼'))
         prepare_menu = QMenu(prepare_button)
         consistency_pass_action = QAction(_('Build Brief'), prepare_button)
+        consistency_glossary_action = QAction(
+            _('Run Consistency Pass'), prepare_button)
         agreement_pass_action = QAction(_('Run Agreement Pass'),
                                         prepare_button)
         prepare_menu.addAction(consistency_pass_action)
+        prepare_menu.addAction(consistency_glossary_action)
         prepare_menu.addAction(agreement_pass_action)
         prepare_button.setMenu(prepare_menu)
         # Keep legacy references so the rest of the code (visibility
@@ -1316,6 +1397,8 @@ class AdvancedTranslation(QDialog):
         delete_button.clicked.connect(self.table.delete_selected_rows)
         consistency_pass_action.triggered.connect(
             self.run_consistency_pass)
+        consistency_glossary_action.triggered.connect(
+            self.run_glossary_consistency_pass)
         agreement_pass_action.triggered.connect(
             self.run_agreement_pass)
         translate_all.clicked.connect(self.translate_all_paragraphs)
@@ -1326,6 +1409,7 @@ class AdvancedTranslation(QDialog):
         self.consistency_pass_button = prepare_button
         self.agreement_pass_button = prepare_button
         self.consistency_pass_action = consistency_pass_action
+        self.consistency_glossary_action = consistency_glossary_action
         self.agreement_pass_action = agreement_pass_action
 
         action_layout.addWidget(delete_button)
@@ -1496,6 +1580,20 @@ class AdvancedTranslation(QDialog):
             update_agreement_pass_button()
         self.trans_worker.agreement_completed.connect(
             record_agreement_pass_time)
+
+        def record_consistency_glossary_time(count):
+            if self.cache is not None:
+                try:
+                    from datetime import datetime
+                    self.cache.set_info(
+                        'last_consistency_pass_glossary',
+                        datetime.now().strftime('%Y-%m-%d %H:%M'))
+                except Exception:
+                    pass
+            if hasattr(self, 'update_consistency_pass_button'):
+                self.update_consistency_pass_button()
+        self.trans_worker.consistency_glossary_completed.connect(
+            record_consistency_glossary_time)
 
         self.batch_translation.connect(
             lambda: batch_translation.setVisible(
@@ -2107,6 +2205,18 @@ class AdvancedTranslation(QDialog):
             return
         self.progress_step = self.get_progress_step(len(paragraphs))
         self.trans_worker.consistency.emit(paragraphs)
+
+    def run_glossary_consistency_pass(self):
+        """Rebuild the Consistency Pass glossary from current
+        translated paragraphs. Uses all paragraphs (global pass).
+        """
+        if self.cache is None:
+            return
+        paragraphs = self.cache.all_paragraphs() or []
+        if len(paragraphs) < 1:
+            return
+        self.progress_step = self.get_progress_step(len(paragraphs))
+        self.trans_worker.consistency_glossary.emit(paragraphs)
 
     def run_agreement_pass(self):
         """Run an Agreement Pass over every paragraph in the book

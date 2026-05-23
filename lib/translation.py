@@ -84,6 +84,7 @@ class Translation:
         self.streaming = dummy
         self.callback = dummy
         self.cancel_request = dummy
+        self.cache = None
 
         self.total = 0
         self.progress_bar = ProgressBar()
@@ -109,6 +110,9 @@ class Translation:
 
     def set_cancel_request(self, cancel_request):
         self.cancel_request = cancel_request
+
+    def set_cache(self, cache):
+        self.cache = cache
 
     def need_stop(self):
         # Cancel the request if there are more than max continuous errors.
@@ -499,15 +503,24 @@ class Translation:
     def consistency_pass(self, paragraphs):
         """Run a Pass-2 consistency review over the translated paragraphs
         if the engine supports it and the user has enabled the feature.
-        Identifies inconsistencies in character names, gender forms, and
-        terminology, then applies corrections to the paragraphs and
-        triggers the cache update via the existing callback."""
+        Stores the resulting glossary in the cache under
+        'consistency_pass_glossary' — does NOT modify paragraph
+        translations. Glossary substitutions are applied at export
+        time (in lib/conversion.py), keeping the cached translations
+        pristine. Skips if a glossary is already cached (rebuild via
+        the 'Run Consistency Pass' button)."""
         if not getattr(self.translator, 'enable_consistency_pass', False):
             return
         if not hasattr(self.translator, 'consistency_review'):
             return
         if self.cancel_request():
             return
+        if self.cache is not None:
+            try:
+                if self.cache.get_info('consistency_pass_glossary'):
+                    return
+            except Exception:
+                pass
 
         # Stable ordering: use the row attribute (or insertion order) so
         # the index we send to the model lines up with our local lookup.
@@ -604,57 +617,25 @@ class Translation:
                        'actionable variants.'))
             return
 
-        # Apply each substitution as a word-boundary regex over every
-        # paragraph's translation. Word boundaries (\b) work on
-        # Unicode word characters in Python 3 — includes Hebrew,
-        # Arabic, etc. — and prevent substring corruption (e.g.
-        # "אשקום" inside "אשקומב" doesn't match because \b at the
-        # end requires a non-word char after, but ב is a word char).
-        import re
-        applied_paragraphs = 0
-        total_substitutions = 0
-        per_variant_counts = {}
-        for paragraph in (index_to_paragraph[i['index']]
-                          for i in items
-                          if i['index'] in index_to_paragraph):
-            if self.cancel_request():
-                break
-            text = paragraph.translation
-            original = text
-            paragraph_subs = []  # (variant, canonical, count)
-            for variant, canonical, _idx in substitutions:
-                pattern = r'\b' + re.escape(variant) + r'\b'
-                new_text, n = re.subn(pattern, canonical, text)
-                if n > 0:
-                    paragraph_subs.append((variant, canonical, n))
-                    total_substitutions += n
-                    per_variant_counts[variant] = (
-                        per_variant_counts.get(variant, 0) + n)
-                    text = new_text
-            if text != original:
-                paragraph.translation = text
-                if self.translator.merge_enabled:
-                    paragraph.do_aligment(self.translator.separator)
-                applied_paragraphs += 1
-                row_label = (paragraph.row if paragraph.row >= 0
-                             else paragraph_subs[0][0])
-                self.log(sep('┈'))
-                self.log(_('Row {}:').format(row_label))
-                for variant, canonical, n in paragraph_subs:
-                    self.log('  ✓ {} → {} (×{})'.format(
-                        variant, canonical, n))
-                self.callback(paragraph)
-
-        self.log(sep('┈'))
-        self.log(_('Consistency pass: applied {} substitution(s) '
-                   'across {} paragraph(s).')
-                 .format(total_substitutions, applied_paragraphs))
-        if per_variant_counts:
-            self.log(_('Per-variant totals:'))
-            for variant in sorted(per_variant_counts,
-                                  key=lambda v: -per_variant_counts[v]):
-                self.log('  {} ×{}'.format(
-                    variant, per_variant_counts[variant]))
+        # Store the glossary in cache — do NOT apply to paragraphs.
+        # Substitutions are applied at export time (convert_book) so
+        # cached translations remain the pristine draft.
+        import json as _json
+        if self.cache is not None:
+            try:
+                self.cache.set_info(
+                    'consistency_pass_glossary',
+                    _json.dumps(glossary, ensure_ascii=False))
+                self.log(_('Consistency pass: glossary ({} entries, '
+                           '{} substitution rules) cached for '
+                           'export.').format(len(glossary),
+                                             len(substitutions)))
+            except Exception as e:
+                self.log(_('Consistency pass: failed to cache '
+                           'glossary: {}').format(str(e)), True)
+        else:
+            self.log(_('Consistency pass: no cache available — '
+                       'glossary will not persist.'))
 
 
 def get_engine_class(engine_name=None):

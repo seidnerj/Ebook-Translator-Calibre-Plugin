@@ -1503,20 +1503,14 @@ class AdvancedTranslation(QDialog):
         def update_agreement_pass_button():
             from .engines.anthropic import ClaudeTranslate
             engine_class = self.current_engine
-            opted_in = bool(
-                engine_class is not None
-                and engine_class.config.get(
-                    'enable_agreement_pass',
-                    getattr(engine_class,
-                            'enable_agreement_pass', False)))
-            supported = (
+            visible = (
                 engine_class is not None
                 and issubclass(engine_class, ClaudeTranslate)
                 and getattr(engine_class,
                             'supports_agreement_review', False)
             )
-            agreement_pass_action.setVisible(supported and opted_in)
-            if not supported or not opted_in:
+            agreement_pass_action.setVisible(visible)
+            if not visible:
                 return
             has_brief = _has_brief_in_cache()
             has_translation = _has_any_translation()

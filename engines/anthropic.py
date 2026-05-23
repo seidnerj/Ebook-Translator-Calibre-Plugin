@@ -76,7 +76,7 @@ class ClaudeTranslate(GenAI):
     # per-paragraph translation call so canonical names, character
     # gender, and recurring terminology stay consistent. Default on
     # for Claude. User can disable to skip the brief build.
-    enable_translation_brief = True
+    enable_translation_brief = False
     # Agreement Pass: opt-in revision pass that scans translated
     # paragraphs for residual gender/number drift against the
     # canonical character morphology in the brief and emits single-
@@ -86,7 +86,7 @@ class ClaudeTranslate(GenAI):
     # validates uniqueness before applying. Default off; manual
     # button trigger.
     supports_agreement_review = True
-    enable_agreement_pass = True
+    enable_agreement_pass = False
     # Copyright-refusal mitigation toggles. All default-on; individually
     # toggleable for users who prefer fail-loud over auto-recovery.
     enable_strip_identifying_content = True   # Strip copyright/ISBN paragraphs from cached book context

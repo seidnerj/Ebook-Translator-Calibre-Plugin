@@ -634,32 +634,11 @@ class TranslationSetting(QDialog):
         refusal_retries_value.setVisible(False)
         genai_layout.addRow(refusal_retries_label, refusal_retries_value)
 
-        consistency_pass_label = QLabel(_('Consistency Pass'))
-        consistency_pass_enabled = QCheckBox(_(
-            'Automatically run a consistency pass after translation '
-            '(extra API call)'))
-        consistency_pass_enabled.setToolTip(_(
-            'When checked, automatically run a Pass-2 consistency review '
-            'after the main translation completes — identifying and '
-            'correcting inconsistencies in character names, gender forms, '
-            'and recurring terminology. Only the translated text is sent '
-            '— the original copyrighted source is never re-included.\n\n'
-            'Independent of this setting, you can also run the '
-            'consistency pass manually from the advanced translation '
-            'window once all paragraphs are translated.'))
-        consistency_pass_label.setVisible(False)
-        consistency_pass_enabled.setVisible(False)
-        genai_layout.addRow(consistency_pass_label, consistency_pass_enabled)
-
-        # Translation Brief (Claude only). Auto-builds a structured
-        # reference document (canonical names, character profiles
-        # with grammatical gender, recurring terminology, style
-        # decisions) before drafting and injects it into every
-        # per-paragraph translation call. Default on.
+        # 1. Translation Brief — runs BEFORE/DURING translation.
         translation_brief_label = QLabel(_('Translation Brief'))
         translation_brief_enabled = QCheckBox(_(
-            'Auto-build a Translation Brief before drafting and '
-            'use it during per-paragraph translation'))
+            'Automatically build a Translation Brief before '
+            'drafting and use it during per-paragraph translation'))
         translation_brief_enabled.setToolTip(_(
             'When checked, the first translation in each book '
             'auto-builds a Translation Brief — a structured '
@@ -671,36 +650,46 @@ class TranslationSetting(QDialog):
             'translation, keeping names and gender consistent '
             'across the whole book.\n\n'
             'You can also build / rebuild the brief manually from '
-            'the advanced translation window via the "Build '
-            'Brief" button.\n\n'
-            'Disabling this skips the brief entirely — '
-            'translation falls back to the legacy per-paragraph '
-            'flow with full-book context only.'))
+            'the advanced translation window via Prepare > '
+            'Build Brief.'))
         translation_brief_label.setVisible(False)
         translation_brief_enabled.setVisible(False)
         genai_layout.addRow(
             translation_brief_label, translation_brief_enabled)
 
-        # Agreement Pass (Claude only). Opt-in revision pass that
-        # scans translated paragraphs for residual gender/number/
-        # pronoun drift against the canonical character morphology
-        # in the brief and emits single-occurrence find/replace
-        # fixes. The setting only controls visibility/availability;
-        # the pass itself is always manually triggered via the
-        # advanced translation window's "Run Agreement Pass" button.
+        # 2. Consistency Pass — runs AFTER translation.
+        consistency_pass_label = QLabel(_('Consistency Pass'))
+        consistency_pass_enabled = QCheckBox(_(
+            'Automatically run a consistency pass after translation '
+            '(extra API call)'))
+        consistency_pass_enabled.setToolTip(_(
+            'When checked, automatically run a Pass-2 consistency '
+            'review after the main translation completes — '
+            'identifying inconsistencies in character names, gender '
+            'forms, and recurring terminology. Substitutions are '
+            'applied at export time; cached translations are never '
+            'modified. Only the translated text is sent — the '
+            'original copyrighted source is never re-included.\n\n'
+            'You can also run or rebuild manually via Prepare > '
+            'Run Consistency Pass.'))
+        consistency_pass_label.setVisible(False)
+        consistency_pass_enabled.setVisible(False)
+        genai_layout.addRow(consistency_pass_label, consistency_pass_enabled)
+
+        # 3. Agreement Pass — runs AFTER translation.
         agreement_pass_label = QLabel(_('Agreement Pass'))
         agreement_pass_enabled = QCheckBox(_(
-            'Enable post-translation Agreement Pass (gender / '
-            'number / pronoun drift correction)'))
+            'Automatically run an Agreement Pass after translation '
+            '(gender / number / pronoun agreement correction)'))
         agreement_pass_enabled.setToolTip(_(
-            'When enabled, the "Run Agreement Pass" button is '
-            'available in the advanced translation window. The '
-            'pass scans translated paragraphs for residual gender '
-            '/ number / pronoun agreement drift against the '
-            'canonical character morphology in the brief and '
-            'applies single-occurrence find/replace fixes. Sees '
-            'only translated text — no copyrighted source material '
-            'is sent. Default on; uncheck to hide the button.'))
+            'When checked, automatically scan translated paragraphs '
+            'for residual gender / number / pronoun agreement drift '
+            'against the canonical character morphology in the '
+            'Translation Brief and apply single-occurrence fixes at '
+            'export time. Only translated text is sent — no '
+            'copyrighted source material.\n\n'
+            'You can also run or rebuild manually via Prepare > '
+            'Run Agreement Pass.'))
         agreement_pass_label.setVisible(False)
         agreement_pass_enabled.setVisible(False)
         genai_layout.addRow(
@@ -965,10 +954,10 @@ class TranslationSetting(QDialog):
             prompt_caching_enabled.setVisible(False)
             refusal_retries_label.setVisible(False)
             refusal_retries_value.setVisible(False)
-            consistency_pass_label.setVisible(False)
-            consistency_pass_enabled.setVisible(False)
             translation_brief_label.setVisible(False)
             translation_brief_enabled.setVisible(False)
+            consistency_pass_label.setVisible(False)
+            consistency_pass_enabled.setVisible(False)
             agreement_pass_label.setVisible(False)
             agreement_pass_enabled.setVisible(False)
             strip_identifying_label.setVisible(False)
@@ -1042,10 +1031,10 @@ class TranslationSetting(QDialog):
                 prompt_caching_enabled.setVisible(True)
                 refusal_retries_label.setVisible(True)
                 refusal_retries_value.setVisible(True)
-                consistency_pass_label.setVisible(True)
-                consistency_pass_enabled.setVisible(True)
                 translation_brief_label.setVisible(True)
                 translation_brief_enabled.setVisible(True)
+                consistency_pass_label.setVisible(True)
+                consistency_pass_enabled.setVisible(True)
                 agreement_pass_label.setVisible(True)
                 agreement_pass_enabled.setVisible(True)
                 strip_identifying_label.setVisible(True)

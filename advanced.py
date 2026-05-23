@@ -399,7 +399,9 @@ class TranslationWorker(QObject):
         # system prompt. Strip review-pipeline metadata (the
         # _review_*_changes keys) before injecting — those are build-
         # time artifacts, not part of the brief's reference content.
-        if self.brief is not None:
+        if (self.brief is not None
+                and getattr(translator, 'enable_translation_brief',
+                            False)):
             brief_for_drafting = {
                 k: v for k, v in self.brief.items()
                 if not (isinstance(k, str) and k.startswith('_review_'))}

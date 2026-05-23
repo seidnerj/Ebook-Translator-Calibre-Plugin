@@ -6,7 +6,7 @@ from qt.core import (  # type: ignore
     QPlainTextEdit, QPushButton, QSplitter, QLabel, QThread, QLineEdit,
     QGridLayout, QProgressBar, pyqtSignal, pyqtSlot, QPixmap, QEvent,
     QStackedWidget, QSpacerItem, QTabWidget, QCheckBox,
-    QComboBox, QSizePolicy, QTextCursor)
+    QComboBox, QSizePolicy, QTextCursor, QToolButton, QMenu, QAction)
 from calibre.constants import __version__  # type: ignore
 from calibre.gui2 import I  # type: ignore
 from calibre.utils.localization import _  # type: ignore
@@ -1289,39 +1289,49 @@ class AdvancedTranslation(QDialog):
         # user wants to regenerate the brief explicitly — e.g. after
         # discovering issues in the brief or after editing source
         # paragraphs.
-        consistency_pass_button = QPushButton(
-            '  %s  ' % _('Build Brief'))
-        # Agreement Pass: post-translation revision pass that fixes
-        # gender/number/pronoun drift in the translated text against
-        # the brief. Visible only for Claude; disabled until both a
-        # brief exists and at least one translation is present.
-        agreement_pass_button = QPushButton(
-            '  %s  ' % _('Run Agreement Pass'))
+        # Dropdown button combining Build Brief and Run Agreement
+        # Pass — both are Claude-specific preparation actions that
+        # share the same visibility/enable logic, so they live under
+        # one "Prepare ▼" menu to avoid crowding the toolbar.
+        prepare_button = QToolButton()
+        prepare_button.setText('  %s  ' % _('Prepare ▼'))
+        prepare_button.setPopupMode(QToolButton.InstantPopup)
+        prepare_menu = QMenu(prepare_button)
+        consistency_pass_action = QAction(_('Build Brief'), prepare_button)
+        agreement_pass_action = QAction(_('Run Agreement Pass'),
+                                        prepare_button)
+        prepare_menu.addAction(consistency_pass_action)
+        prepare_menu.addAction(agreement_pass_action)
+        prepare_button.setMenu(prepare_menu)
+        # Keep legacy references so the rest of the code (visibility
+        # helpers, tooltip updates) still works via these names.
+        consistency_pass_button = prepare_button
+        agreement_pass_button = prepare_button
+
         translate_all = QPushButton('  %s  ' % _('Translate All'))
         translate_untranslated = QPushButton(
             '  %s  ' % _('Translate Untranslated'))
         translate_selected = QPushButton('  %s  ' % _('Translate Selected'))
 
         delete_button.clicked.connect(self.table.delete_selected_rows)
-        consistency_pass_button.clicked.connect(
+        consistency_pass_action.triggered.connect(
             self.run_consistency_pass)
-        agreement_pass_button.clicked.connect(
+        agreement_pass_action.triggered.connect(
             self.run_agreement_pass)
         translate_all.clicked.connect(self.translate_all_paragraphs)
         translate_untranslated.clicked.connect(
             self.translate_untranslated_paragraphs)
         translate_selected.clicked.connect(self.translate_selected_paragraph)
 
-        # Track the button so update_consistency_pass_button() can read its
-        # state.
-        self.consistency_pass_button = consistency_pass_button
-        self.agreement_pass_button = agreement_pass_button
+        self.consistency_pass_button = prepare_button
+        self.agreement_pass_button = prepare_button
+        self.consistency_pass_action = consistency_pass_action
+        self.agreement_pass_action = agreement_pass_action
 
         action_layout.addWidget(delete_button)
         action_layout.addStretch(1)
         action_layout.addWidget(batch_translation)
-        action_layout.addWidget(consistency_pass_button)
-        action_layout.addWidget(agreement_pass_button)
+        action_layout.addWidget(prepare_button)
         action_layout.addWidget(translate_all)
         action_layout.addWidget(translate_untranslated)
         action_layout.addWidget(translate_selected)
@@ -1336,13 +1346,8 @@ class AdvancedTranslation(QDialog):
         delete_button.setDisabled(True)
         translate_selected.setDisabled(True)
 
-        # Consistency pass: the button is a manual trigger and is shown
-        # for Claude regardless of the "auto-run after translation"
-        # setting. The setting only controls whether the pass runs
-        # automatically at the end of translate_paragraphs; users can
-        # always invoke it manually via this button.
-        consistency_pass_button.setVisible(False)
-        agreement_pass_button.setVisible(False)
+        # Prepare dropdown: visible only for Claude engines.
+        prepare_button.setVisible(False)
 
         def _last_consistency_pass_label():
             """Return a human-readable 'Last run: ...' string from cache,
@@ -1361,28 +1366,23 @@ class AdvancedTranslation(QDialog):
                 engine_class is not None
                 and issubclass(engine_class, ClaudeTranslate)
             )
-            consistency_pass_button.setVisible(visible)
+            prepare_button.setVisible(visible)
             if not visible:
                 return
-            # Enabled whenever source text exists — brief is built
-            # from source, translation isn't required.
-            total_rows = self.table.rowCount()
-            has_source = total_rows > 0
-            consistency_pass_button.setEnabled(has_source)
+            has_source = self.table.rowCount() > 0
+            consistency_pass_action.setEnabled(has_source)
             if has_source:
-                consistency_pass_button.setToolTip(_(
+                consistency_pass_action.setToolTip(_(
                     'Build a Translation Brief — a structured '
                     'reference document with canonical names, '
                     'character profiles (with grammatical gender '
                     'for verb/adjective agreement), recurring '
-                    'terminology, and style decisions. Generated '
-                    'once from the source text; cached and reused '
-                    'on every subsequent translation. Translation '
-                    'auto-builds this on first run if missing; '
-                    'click here to rebuild manually.\n\nLast run: {}'
+                    'terminology, and style decisions. Cached and '
+                    'reused on every subsequent translation; click '
+                    'to rebuild.\n\nLast run: {}'
                 ).format(_last_consistency_pass_label()))
             else:
-                consistency_pass_button.setToolTip(_(
+                consistency_pass_action.setToolTip(_(
                     'Disabled until source paragraphs are loaded.'))
 
         # Save references the callback chain can reach.
@@ -1425,37 +1425,34 @@ class AdvancedTranslation(QDialog):
                     'enable_agreement_pass',
                     getattr(engine_class,
                             'enable_agreement_pass', False)))
-            visible = (
+            supported = (
                 engine_class is not None
                 and issubclass(engine_class, ClaudeTranslate)
                 and getattr(engine_class,
                             'supports_agreement_review', False)
-                and opted_in
             )
-            agreement_pass_button.setVisible(visible)
-            if not visible:
+            agreement_pass_action.setVisible(supported and opted_in)
+            if not supported or not opted_in:
                 return
             has_brief = _has_brief_in_cache()
             has_translation = _has_any_translation()
-            agreement_pass_button.setEnabled(
+            agreement_pass_action.setEnabled(
                 has_brief and has_translation)
             if not has_brief:
-                agreement_pass_button.setToolTip(_(
+                agreement_pass_action.setToolTip(_(
                     'Build a Translation Brief first — the '
                     'Agreement Pass uses canonical character '
                     'morphology from the brief to detect drift.'))
             elif not has_translation:
-                agreement_pass_button.setToolTip(_(
+                agreement_pass_action.setToolTip(_(
                     'Translate at least one paragraph first — the '
                     'Agreement Pass reviews translated text.'))
             else:
-                agreement_pass_button.setToolTip(_(
+                agreement_pass_action.setToolTip(_(
                     'Scan translated paragraphs for residual '
                     'gender / number / pronoun agreement drift '
                     'against the canonical character morphology '
-                    'in the brief, and apply single-occurrence '
-                    'fixes. Sees only translated text — no '
-                    'copyrighted source material is sent.\n\n'
+                    'in the brief. Cached; click to regenerate.\n\n'
                     'Last run: {}'
                 ).format(_last_agreement_pass_label()))
 
